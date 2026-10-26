@@ -17466,3 +17466,17 @@ fn landuse_template_fills_the_code() {
     s.run("edit.addFeature", &json!({"layer": "P", "geometry": square, "template": "Đất đơn vị ở (ODV)"})).unwrap();
     assert_eq!(codes(&s), ["ODV"]);
 }
+
+#[test]
+fn landuse_tt12_reports_and_keeps_user_templates() {
+    let mut s = parcels(&["Đất đơn vị ở", "???"]);
+    s.run("edit.template", &json!({"layer": "P", "name": "Nhà A (ODV)"})).unwrap();
+    let mark = s.notices.len();
+    s.run("landuse.tt12", &json!({"layer": "P", "nameField": "loaidat"})).unwrap();
+    let said: Vec<&str> = s.notices.iter().skip(mark).map(|n| n.text.as_str()).collect();
+    assert!(said.iter().any(|t| t.contains('1') && t.contains("no Circular 12 name")), "{said:?}");
+    s.run("landuse.tt12", &json!({"layer": "P"})).unwrap();
+    let names: Vec<String> = s.map().layer_by_name("P").unwrap().design.templates.iter().map(|t| t.name.clone()).collect();
+    assert!(names.iter().any(|n| n == "Nhà A (ODV)"), "the user's own template stays");
+    assert_eq!(names.len(), 37);
+}

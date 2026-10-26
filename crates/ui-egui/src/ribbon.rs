@@ -4437,8 +4437,7 @@ fn feature_data_groups(app: &mut RustGisApp, ui: &mut Ui) {
             ui,
             app,
             "unique",
-            "Circular 12
-Land Use",
+            "Circular 12\nLand Use",
             "Add the 'layer' code field, Circular 12 colours and images, and a template per land-use group.",
             "ui.dialog",
             json!({"name": "landuseTt12"}),

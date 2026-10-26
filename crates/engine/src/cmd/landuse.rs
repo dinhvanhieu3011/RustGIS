@@ -9,6 +9,9 @@ use serde_json::{Value as Json, json};
 use super::{need_feature_layer, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
 
+/// The description of the templates this makes, by which a second run knows them.
+const TEMPLATE_NOTE: &str = "Circular 12 land-use group";
+
 pub fn commands() -> Vec<C> {
     vec![
         C::new("landuse.tt12", "Circular 12 Land Use", "Data › Data Design › Fields", tt12_layer)
@@ -57,14 +60,26 @@ fn tt12_layer(s: &mut Session, p: &Json) -> CmdResult {
     }
     l.renderer = tt12::renderer();
     l.tt12 = true;
-    let ours = |name: &str| tt12::GROUPS.iter().any(|g| name.ends_with(&format!(" ({})", g.code)));
-    l.design.templates.retain(|t| !ours(&t.name));
+    // Made here before (or named as this makes them): replaced, so a second run doesn't double them.
+    let ours = |t: &FeatureTemplate| {
+        t.description == TEMPLATE_NOTE || tt12::GROUPS.iter().any(|g| t.name.eq_ignore_ascii_case(&format!("{} ({})", g.name, g.code)))
+    };
+    l.design.templates.retain(|t| !ours(t));
     for g in &tt12::GROUPS {
         l.design.templates.push(FeatureTemplate {
             name: format!("{} ({})", g.name, g.code),
-            description: String::new(),
+            description: TEMPLATE_NOTE.into(),
             defaults: vec![(tt12::FIELD.into(), Value::Text(g.code.into()))],
         });
     }
+    let layer = l.name.clone();
+    s.notify(
+        match (names, unmatched) {
+            (None, _) => format!("{layer}: Circular 12 style and templates set"),
+            (Some(_), 0) => format!("{layer}: {matched} parcels coded from their names, {kept} kept"),
+            (Some(_), n) => format!("{layer}: {matched} parcels coded, {n} with no Circular 12 name matched (their 'layer' is empty)"),
+        },
+        unmatched > 0,
+    );
     Ok(json!({"matched": matched, "unmatched": unmatched, "kept": kept, "templates": tt12::GROUPS.len()}))
 }

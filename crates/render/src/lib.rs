@@ -3070,6 +3070,8 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                     }
                 } else {
                     let mut stroke_paths = stroke_paths::Paths::default();
+                    // The Circular 12 image folder, looked for once per layer and frame, when needed.
+                    let mut images: Option<landuse_fill::Images> = None;
                     // Symbol levels: lines with stacked strokes wait, and go down a level at a time
                     // after the rest (each batch of a streamed layer on its own).
                     let levels = layer.stroke_levels && layer.has_strokes();
@@ -3095,7 +3097,7 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                         if let Geometry::Polygon(polys) = g
                             && !ctx.wireframe
                             && let Some((image, outline)) = layer.tt12_image(row, scale)
-                            && let Some(tile) = landuse_fill::tile(image)
+                            && let Some(tile) = images.get_or_insert_with(landuse_fill::Images::find).tile(image)
                         {
                             ctx.polygon_pattern(dest, polys, &tile, outline, layer.symbol(row).stroke_width);
                             continue;
