@@ -4433,6 +4433,18 @@ fn feature_data_groups(app: &mut RustGisApp, ui: &mut Ui) {
     group(ui, "Data Design", |ui| {
         big(ui, app, "field", "Fields", "Add a field.", "ui.dialog", json!({"name": "addField"}), false, false);
         big(ui, app, "calculate", "Calculate", "Calculate field values.", "ui.dialog", json!({"name": "calculateField"}), false, false);
+        big(
+            ui,
+            app,
+            "unique",
+            "Circular 12
+Land Use",
+            "Add the 'layer' code field, Circular 12 colours and images, and a template per land-use group.",
+            "ui.dialog",
+            json!({"name": "landuseTt12"}),
+            false,
+            false,
+        );
         let open = app.ui.right == Some(RightPane::Design);
         col(ui, |ui| {
             small(

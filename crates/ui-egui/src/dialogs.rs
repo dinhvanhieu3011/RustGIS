@@ -59,6 +59,7 @@ impl Dialogs {
             "bookmark" => "bookmark",
             "addField" => "addField",
             "calculateField" => "calculateField",
+            "landuseTt12" => "landuseTt12",
             "definitionQuery" => "definitionQuery",
             "renameLayer" => "renameLayer",
             "renameMap" => "renameMap",
@@ -88,8 +89,10 @@ impl Dialogs {
             "saveProject" => "saveProject",
             other => return Err(format!("unknown dialog '{other}'")),
         };
-        if matches!(name, "addField" | "calculateField" | "definitionQuery" | "renameLayer" | "exportLayer" | "defineProjection")
-            && active.is_none()
+        if matches!(
+            name,
+            "addField" | "calculateField" | "landuseTt12" | "definitionQuery" | "renameLayer" | "exportLayer" | "defineProjection"
+        ) && active.is_none()
         {
             return Err("select a layer in the Layers pane first".into());
         }
@@ -129,6 +132,7 @@ impl Dialogs {
                 self.c = format!("{:.0}", s.scale());
             }
             "addField" => self.b = "Double".into(),
+            "landuseTt12" => self.a.clear(),
             "calculateField" => self.a = active.and_then(|l| l.dataset.fields.last()).map(|f| f.name.clone()).unwrap_or_default(),
             "definitionQuery" => self.text = active.and_then(|l| l.definition_query.clone()).unwrap_or_default(),
             "renameLayer" => self.text = active.map(|l| l.name.clone()).unwrap_or_default(),
@@ -164,6 +168,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "goToXY" => "Go To XY",
         "bookmark" => "New Bookmark",
         "addField" => "Add Field",
+        "landuseTt12" => "Circular 12 Land Use",
         "calculateField" => "Calculate Field",
         "definitionQuery" => "Definition Query",
         "coordinateSystem" => "Coordinate System",
@@ -363,6 +368,42 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     ui.end_row();
                 });
                 close = buttons(app, ui, "Add", |app| app.run("edit.addField", json!({"name": app.dialogs.a, "type": app.dialogs.b})).map(|_| ()));
+            }
+            "landuseTt12" => {
+                let fields: Vec<String> = app
+                    .session
+                    .active_layer
+                    .and_then(|id| app.session.map().layer(id))
+                    .map(|l| {
+                        l.dataset
+                            .fields
+                            .iter()
+                            .filter(|f| f.ty == rustgis_engine::data::FieldType::Text && f.name != rustgis_engine::map::tt12::FIELD)
+                            .map(|f| f.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ui.label(tl!("Adds the 'layer' code field, the Circular 12 colours and images, and a feature template per land-use group."));
+                egui::Grid::new("tt12").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+                    let input_label = ui.label(tl!("Land-use names in"));
+                    let none = tl!("None").to_string();
+                    let shown = if app.dialogs.a.is_empty() { none.clone() } else { app.dialogs.a.clone() };
+                    egui::ComboBox::from_id_salt("tt12_names")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut app.dialogs.a, String::new(), none);
+                            for f in &fields {
+                                ui.selectable_value(&mut app.dialogs.a, f.clone(), f);
+                            }
+                        })
+                        .response
+                        .labelled_by(input_label.id);
+                    ui.end_row();
+                });
+                close = buttons(app, ui, "Apply", |app| {
+                    let p = if app.dialogs.a.is_empty() { json!({}) } else { json!({"nameField": app.dialogs.a}) };
+                    app.run("landuse.tt12", p).map(|_| ())
+                });
             }
             "calculateField" => {
                 let fields: Vec<String> = app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| l.dataset.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default();
