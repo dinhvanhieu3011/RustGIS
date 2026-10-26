@@ -22,6 +22,7 @@ pub mod source;
 pub mod symbology;
 pub mod tiles;
 pub mod time;
+pub mod tt12;
 pub mod view;
 mod view_memory;
 pub mod world;
