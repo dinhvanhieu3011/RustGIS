@@ -153,6 +153,10 @@ pub struct Layer {
     /// instead of cutting across them where lines meet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stroke_levels: bool,
+    /// Drawn as a Circular 12 land-use layer ([`tt12`]): at 1:[`tt12::IMAGE_SCALE`] or closer a
+    /// parcel fills with its group's image instead of its colour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tt12: bool,
     /// The scale (1:N) its symbol and label sizes are set for: drawn at another scale they grow
     /// and shrink with the map, as on paper (QGIS's reference scale). `None`: they keep their
     /// size on screen.
@@ -309,6 +313,7 @@ impl Layer {
             extrusion: None,
             line_strokes: Vec::new(),
             stroke_levels: false,
+            tt12: false,
             reference_scale: None,
             priority: 0,
             design: design::Design::default(),
@@ -497,6 +502,17 @@ impl Layer {
         }
         ds.source = self.dataset.source.clone();
         Ok(ds)
+    }
+
+    /// The image file and outline a Circular 12 layer's row draws with at `scale` (1:N): none
+    /// further out than [`tt12::IMAGE_SCALE`], off a Circular 12 layer, or for a code in no group.
+    pub fn tt12_image(&self, row: usize, scale: f64) -> Option<(&'static str, Rgba)> {
+        if !self.tt12 || scale.is_nan() || scale > tt12::IMAGE_SCALE {
+            return None;
+        }
+        let fi = self.dataset.field_index(tt12::FIELD)?;
+        let rustgis_data::Value::Text(code) = self.dataset.features.get(row)?.attrs.get(fi)? else { return None };
+        tt12::group_of(code).map(|g| (g.image, g.outline))
     }
 
     /// The symbol a row draws with.
@@ -1736,6 +1752,27 @@ mod tests {
         d.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Int(1)]);
         d.push(Some(Geometry::Point(Coord::new(10.0, 10.0))), vec![Value::Int(2)]);
         d
+    }
+
+    #[test]
+    fn tt12_image_by_code_and_scale() {
+        let mut d = Dataset::new("parcels", GeometryType::Polygon, vec![Field::new("layer", FieldType::Text)]);
+        d.push(None, vec![Value::Text("ODV01".into())]);
+        d.push(None, vec![Value::Text("ZZZ".into())]);
+        let mut l = Layer::new(1, d);
+        assert_eq!(l.tt12_image(0, 5000.0), None, "not a Circular 12 layer");
+        l.tt12 = true;
+        assert_eq!(l.tt12_image(0, 5000.0), Some(("DatDonViO.png", color::Rgba::rgb(0xff, 0x7c, 0x01))));
+        assert_eq!(l.tt12_image(0, 10_000.0).map(|i| i.0), Some("DatDonViO.png"));
+        assert_eq!(l.tt12_image(0, 50_000.0), None);
+        assert_eq!(l.tt12_image(1, 5000.0), None);
+        assert_eq!(l.tt12_image(99, 5000.0), None);
+        let back: Layer = serde_json::from_value(serde_json::to_value(&l).unwrap()).unwrap();
+        assert!(back.tt12);
+        let mut old = serde_json::to_value(Layer::new(2, Dataset::new("p", GeometryType::Polygon, vec![]))).unwrap();
+        assert!(old.get("tt12").is_none(), "left out when off");
+        old.as_object_mut().unwrap().remove("tt12");
+        assert!(!serde_json::from_value::<Layer>(old).unwrap().tt12);
     }
 
     #[test]
