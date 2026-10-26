@@ -10,6 +10,7 @@ mod effects;
 pub mod families;
 pub mod fonts;
 pub mod gpu_scene;
+pub mod landuse_fill;
 pub mod layout;
 mod line_labels;
 mod line_markers;
@@ -602,6 +603,21 @@ impl Ctx<'_> {
             let st = Stroke { width: w * self.ppp, line_join: LineJoin::Round, ..Stroke::default() };
             pm.stroke_path(&path, &s, &st, Transform::identity(), None);
         }
+    }
+
+    /// A polygon filled with `tile` repeated (a device pixel per image pixel at 1 point per
+    /// pixel) and outlined in `outline`.
+    fn polygon_pattern(&self, pm: &mut Pixmap, polys: &[Vec<Vec<Coord>>], tile: &Pixmap, outline: Rgba, width: f32) {
+        let mut fill = Paint::default();
+        fill.shader = tiny_skia::Pattern::new(
+            tile.as_ref(),
+            SpreadMode::Repeat,
+            tiny_skia::FilterQuality::Nearest,
+            1.0,
+            Transform::from_scale(self.ppp, self.ppp),
+        );
+        fill.anti_alias = ANTIALIAS.with(|a| a.get());
+        self.polygon(pm, polys, Some(fill), Some((paint(outline, 1.0), width)));
     }
 
     fn line(&self, pm: &mut Pixmap, parts: &[Vec<Coord>], p: &Paint, w: f32) {
@@ -2996,6 +3012,8 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                 && layer.extrusion.is_none()
                 && !layer.graphics
                 && !layer.has_strokes()
+                // Circular 12 image fills are drawn on the CPU.
+                && !(layer.tt12 && scale <= rustgis_map::tt12::IMAGE_SCALE)
                 && !upright.contains(&layer.id);
             // Lyon refuses degenerate geometry tiny-skia draws fine, and a layer too dense to mesh
             // (`MAX_LAYER_VERTICES`) is quicker splatted: collect_layer reports both, and the layer
@@ -3072,6 +3090,15 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                             if x0.max(x1) >= 0.0 && x0.min(x1) <= pw && y0.max(y1) >= 0.0 && y0.min(y1) <= ph {
                                 picture::draw(dest, ds_ptr, row, (x0, y0, x1, y1), if direct { opacity } else { 1.0 });
                             }
+                            continue;
+                        }
+                        // A Circular 12 parcel close in: its group's image, when it reads.
+                        if let Geometry::Polygon(polys) = g
+                            && !ctx.wireframe
+                            && let Some((image, outline)) = layer.tt12_image(row, scale)
+                            && let Some(tile) = landuse_fill::tile(image)
+                        {
+                            ctx.polygon_pattern(dest, polys, &tile, outline, layer.symbol(row).stroke_width);
                             continue;
                         }
                         // Its symbol, and the layer's stacked strokes or the feature's class's own.
@@ -4730,6 +4757,37 @@ mod tests {
         // A clause that doesn't read takes no feature.
         capitals(m.layer_mut(id).unwrap(), "gone = 1");
         assert_eq!(sizes(&mut m), both);
+    }
+
+    #[test]
+    fn circular_12_parcels_fill_with_their_image_close_in() {
+        // The only test that sets the image folder (tiles are keyed by folder, so others don't see it).
+        let dir = std::env::temp_dir().join(format!("rustgis-tt12-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blue = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255]));
+        blue.save(dir.join("DatDonViO.png")).unwrap();
+        landuse_fill::set_image_dir(Some(dir.clone()));
+        let at = Coord::new(105.8, 21.0);
+        let mut m = Map::new("Map");
+        let mut d = Dataset::new("P", GeometryType::Polygon, vec![Field::new("layer", FieldType::Text)]);
+        let ring = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)].map(|(x, y)| Coord::new(at.x + x, at.y + y)).to_vec();
+        d.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Value::Text("ODV".into())]);
+        let id = m.add_dataset(d);
+        if let Some(l) = m.layer_mut(id) {
+            l.renderer = rustgis_map::tt12::renderer();
+            l.tt12 = true;
+        }
+        let mut camera = Camera { center: lonlat_to_merc(at), res: 1.0, bearing: 0.0, pitch: 0.0 };
+        let mut centre = |m: &mut Map, scale: f64| {
+            camera.set_scale(scale);
+            let view = View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+            let p = render(m, &view).unwrap().pixmap.pixel(100, 100).unwrap().demultiply();
+            (p.red(), p.green(), p.blue())
+        };
+        assert_eq!(centre(&mut m, 5_000.0), (0, 0, 255), "the image close in");
+        assert_eq!(centre(&mut m, 50_000.0), (0xff, 0x7c, 0x01), "the colour further out");
+        landuse_fill::set_image_dir(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
