@@ -608,15 +608,14 @@ impl Ctx<'_> {
     /// A polygon filled with `tile` repeated (a device pixel per image pixel at 1 point per
     /// pixel) and outlined in `outline`.
     fn polygon_pattern(&self, pm: &mut Pixmap, polys: &[Vec<Vec<Coord>>], tile: &Pixmap, outline: Rgba, width: f32) {
-        let mut fill = Paint::default();
-        fill.shader = tiny_skia::Pattern::new(
+        let shader = tiny_skia::Pattern::new(
             tile.as_ref(),
             SpreadMode::Repeat,
             tiny_skia::FilterQuality::Nearest,
             1.0,
             Transform::from_scale(self.ppp, self.ppp),
         );
-        fill.anti_alias = ANTIALIAS.with(|a| a.get());
+        let fill = Paint { shader, anti_alias: ANTIALIAS.with(|a| a.get()), ..Paint::default() };
         self.polygon(pm, polys, Some(fill), Some((paint(outline, 1.0), width)));
     }
 
