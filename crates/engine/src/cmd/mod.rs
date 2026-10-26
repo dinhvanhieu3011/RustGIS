@@ -21,6 +21,7 @@ pub mod history;
 pub mod imagery;
 pub mod items;
 pub mod labels;
+pub mod landuse;
 pub mod layer;
 pub mod layer_copy;
 pub mod layout;
@@ -79,6 +80,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(cube_catalog::commands());
     v.extend(select::commands());
     v.extend(edit::commands());
+    v.extend(landuse::commands());
     v.extend(clipboard::commands());
     v.extend(labels::commands());
     v.extend(graphics::commands());

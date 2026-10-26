@@ -347,14 +347,23 @@ pub fn group_of(code: &str) -> Option<&'static Group> {
     GROUPS.iter().find(|g| g.codes.contains(&code))
 }
 
-/// The group a land-use name in words stands for (case, diacritics, spaces and punctuation
-/// ignored), or its group code.
+/// A name's matching key: no case, diacritics, spaces or punctuation, nor a leading "Đất".
+fn key(name: &str) -> String {
+    let k = normalize_vietnamese(name);
+    match k.strip_prefix("dat") {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => k,
+    }
+}
+
+/// The group a land-use name in words stands for (case, diacritics, spaces, punctuation and a
+/// leading "Đất" ignored), or its group code.
 pub fn group_by_name(name: &str) -> Option<&'static Group> {
-    let key = normalize_vietnamese(name);
-    if key.is_empty() {
+    let k = key(name);
+    if k.is_empty() {
         return None;
     }
-    GROUPS.iter().find(|g| normalize_vietnamese(g.name) == key || normalize_vietnamese(g.code) == key)
+    GROUPS.iter().find(|g| key(g.name) == k || normalize_vietnamese(g.code) == normalize_vietnamese(name))
 }
 
 /// A Unique Values renderer on [`FIELD`] with a class per code, in its group's colour.
@@ -399,7 +408,7 @@ mod tests {
         assert_eq!(distinct.len(), 359);
         // No code in two groups.
         assert_eq!(GROUPS.iter().map(|g| g.codes.len()).sum::<usize>(), distinct.len());
-        let names: std::collections::HashSet<_> = GROUPS.iter().map(|g| normalize_vietnamese(g.name)).collect();
+        let names: std::collections::HashSet<_> = GROUPS.iter().map(|g| key(g.name)).collect();
         assert_eq!(names.len(), 36);
     }
 
@@ -411,6 +420,9 @@ mod tests {
         assert_eq!(group_by_name("odv").map(|g| g.code), want);
         assert_eq!(group_by_name("không có"), None);
         assert_eq!(group_by_name("  "), None);
+        assert_eq!(group_by_name("Đất"), None);
+        assert_eq!(group_by_name("Đất mặt nước").map(|g| g.code), Some("MNC"));
+        assert_eq!(group_by_name("don vi o").map(|g| g.code), want);
     }
 
     #[test]

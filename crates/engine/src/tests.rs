@@ -17395,3 +17395,74 @@ fn publication_locator_keeps_small_islands_across_the_antimeridian() {
         assert_eq!(geometry.as_ref(), Some(&original), "island at {lon}, {lat}");
     }
 }
+
+/// A polygon layer "P" with a text field `loaidat`, one square per name.
+fn parcels(names: &[&str]) -> Session {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    use rustgis_geom::Coord;
+    let mut s = world();
+    let mut d = Dataset::new("P", GeometryType::Polygon, vec![Field::new("loaidat", FieldType::Text)]);
+    for (i, n) in names.iter().enumerate() {
+        let x = i as f64;
+        let ring = vec![Coord::new(x, 0.0), Coord::new(x + 0.5, 0.0), Coord::new(x + 0.5, 0.5), Coord::new(x, 0.5), Coord::new(x, 0.0)];
+        d.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![V::Text(n.to_string())]);
+    }
+    s.map_mut().add_dataset(d);
+    s
+}
+
+fn codes(s: &Session) -> Vec<String> {
+    let l = s.map().layer_by_name("P").unwrap();
+    let fi = l.dataset.field_index("layer").unwrap();
+    let text = |v: &rustgis_data::Value| if let rustgis_data::Value::Text(t) = v { t.clone() } else { String::new() };
+    (0..l.dataset.features.len()).map(|r| text(l.dataset.value(r, fi))).collect()
+}
+
+#[test]
+fn landuse_tt12_sets_up_a_layer() {
+    let mut s = parcels(&["Đất đơn vị ở", "dat mat nuoc", "???", ""]);
+    let r = s.run("landuse.tt12", &json!({"layer": "P", "nameField": "loaidat"})).unwrap();
+    assert_eq!((r["matched"].as_u64(), r["unmatched"].as_u64(), r["templates"].as_u64()), (Some(2), Some(1), Some(36)));
+    assert_eq!(codes(&s), ["ODV", "MNC", "", ""]);
+    let l = s.map().layer_by_name("P").unwrap();
+    assert!(l.tt12);
+    assert_eq!(l.renderer.field(), Some("layer"));
+    assert_eq!(l.design.templates.len(), 36);
+    s.run("edit.undo", &json!({})).unwrap();
+    let l = s.map().layer_by_name("P").unwrap();
+    assert!(l.dataset.field_index("layer").is_none() && !l.tt12 && l.design.templates.is_empty());
+}
+
+#[test]
+fn landuse_tt12_twice_keeps_codes_and_templates() {
+    let mut s = parcels(&["Đất đơn vị ở", "Mặt nước"]);
+    s.run("landuse.tt12", &json!({"layer": "P", "nameField": "loaidat"})).unwrap();
+    s.run("edit.setValue", &json!({"layer": "P", "row": 0, "field": "layer", "value": "OLK01"})).unwrap();
+    let r = s.run("landuse.tt12", &json!({"layer": "P", "nameField": "loaidat"})).unwrap();
+    assert_eq!(r["kept"].as_u64(), Some(2));
+    assert_eq!(codes(&s), ["OLK01", "MNC"]);
+    assert_eq!(s.map().layer_by_name("P").unwrap().design.templates.len(), 36);
+}
+
+#[test]
+fn landuse_tt12_refuses_bad_layers() {
+    let mut s = parcels(&["x"]);
+    let e = s.run("landuse.tt12", &json!({"layer": "Cities"})).unwrap_err();
+    assert!(e.contains("polygon"), "{e}");
+    s.run("edit.addField", &json!({"layer": "P", "name": "layer", "type": "long"})).unwrap();
+    assert!(s.run("landuse.tt12", &json!({"layer": "P"})).is_err());
+    assert!(!s.map().layer_by_name("P").unwrap().tt12);
+    let mut s = parcels(&["x"]);
+    assert!(s.run("landuse.tt12", &json!({"layer": "P", "nameField": "nope"})).is_err());
+    assert!(s.map().layer_by_name("P").unwrap().dataset.field_index("layer").is_none());
+}
+
+#[test]
+fn landuse_template_fills_the_code() {
+    let mut s = parcels(&[]);
+    s.run("landuse.tt12", &json!({"layer": "P"})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    let square = json!({"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]});
+    s.run("edit.addFeature", &json!({"layer": "P", "geometry": square, "template": "Đất đơn vị ở (ODV)"})).unwrap();
+    assert_eq!(codes(&s), ["ODV"]);
+}
