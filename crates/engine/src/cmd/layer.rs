@@ -826,6 +826,16 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
     if rustgis_data::filegdb::is_geodatabase(Path::new(path)) {
         return add_geodatabase(s, p, path);
     }
+    // A DWG: converted to a DXF by the ODA File Converter and read as one; through GDAL without it.
+    #[cfg(not(target_arch = "wasm32"))]
+    if rustgis_data::source::oda::is_dwg_name(path) && (rustgis_data::source::oda::available() || !rustgis_data::source::gdal::available())
+    {
+        let dxf = rustgis_data::source::oda::to_dxf(Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+        let bytes = std::fs::read(&dxf).map_err(|e| format!("{path}: {e}"))?;
+        // Named for the drawing, read as a DXF.
+        let name = Path::new(path).with_extension("dxf").display().to_string();
+        return add_layers(s, p, &name, &bytes);
+    }
     #[cfg(not(target_arch = "wasm32"))]
     if rustgis_data::source::gdal::is_gdal_name(path) {
         return add_gdal(s, p, path);

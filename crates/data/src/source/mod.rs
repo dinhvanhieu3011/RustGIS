@@ -27,6 +27,8 @@ pub mod msconn;
 pub mod myconn;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mysql;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod oda;
 pub mod parquet;
 pub mod pgconn;
 #[cfg(not(target_arch = "wasm32"))]

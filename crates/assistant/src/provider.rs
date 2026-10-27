@@ -921,8 +921,31 @@ impl StreamPreview {
     }
 }
 
+/// The first `max` characters of a body; a web page (a proxy's or Cloudflare's error page, a
+/// wrong base URL) is summarised by its title, since its markup says nothing.
+pub(crate) fn body_text(body: &[u8], max: usize) -> String {
+    let text = String::from_utf8_lossy(body);
+    let head = text.trim_start().get(..15).unwrap_or("").to_ascii_lowercase();
+    if head.starts_with("<!doctype html") || head.starts_with("<html") {
+        let lower = text.to_ascii_lowercase();
+        let title = lower
+            .find("<title")
+            .and_then(|i| Some(i + lower.get(i..)?.find('>')? + 1))
+            .and_then(|s| Some((s, s + lower.get(s..)?.find("</title")?)))
+            .and_then(|(s, e)| text.get(s..e))
+            .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|t| !t.is_empty());
+        let page = "a web page instead of an API reply (check the base URL, proxy or network)";
+        return match title {
+            Some(t) => format!("{page}: {}", t.chars().take(max).collect::<String>()),
+            None => page.to_string(),
+        };
+    }
+    text.chars().take(max).collect()
+}
+
 fn http_error(resp: &HttpResponse) -> String {
-    let text: String = String::from_utf8_lossy(&resp.body).chars().take(300).collect();
+    let text = body_text(&resp.body, 300);
     if (200..300).contains(&resp.status) {
         format!("the provider sent something that isn't JSON: {text}")
     } else {

@@ -153,7 +153,7 @@ impl Error {
         let detail = field("message")
             .or_else(|| v.get("detail").and_then(Value::as_str).map(str::to_string))
             .or_else(|| v.get("message").and_then(Value::as_str).map(str::to_string))
-            .or_else(|| v.is_null().then(|| String::from_utf8_lossy(&resp.body).chars().take(500).collect()))
+            .or_else(|| v.is_null().then(|| crate::provider::body_text(&resp.body, 500)))
             .unwrap_or_else(|| "the model's reply failed".into());
         Self {
             recovery,

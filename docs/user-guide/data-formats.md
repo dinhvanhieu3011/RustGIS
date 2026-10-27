@@ -61,7 +61,7 @@ GDAL](data.md#formats-through-gdal).
 
 | Format | Extensions or source | Notes |
 | --- | --- | --- |
-| AutoCAD DWG | `.dwg` | Through GDAL's CAD driver, when it is built in. Give `"crs"` (such as `EPSG:2263`) when the drawing doesn't say its coordinate system. |
+| AutoCAD DWG | `.dwg` | Through the free [ODA File Converter](https://www.opendesign.com/guestfiles/oda_file_converter) (desktop; found on the `PATH`, in `RUSTGIS_ODA_BIN` or its install folder), then read as a DXF: every DWG version, with the DXF options (`"crs"`, `"layer"`, `"paperSpace"`). Without it, through GDAL's CAD driver (DWG R2000 only). |
 | MapInfo tables | `.tab` | Keep the companion files together. |
 | OpenStreetMap XML | `.osm` | |
 | GeoJSON Lines, GMT | `.geojsonl`, `.geojsons`, `.gmt` | |

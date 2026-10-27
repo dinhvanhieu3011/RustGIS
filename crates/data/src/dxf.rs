@@ -9,8 +9,8 @@
 //! and BYBLOCK resolved), linetype, text and elevation.
 //!
 //! A drawing doesn't say its coordinate system: one given converts the coordinates to
-//! longitude/latitude; without one they're kept as they are and the report says so. Binary DXF and
-//! DWG aren't read here.
+//! longitude/latitude; without one they're kept as they are and the report says so. Binary DXF isn't
+//! read here; DWG is, once the ODA File Converter turns it into DXF (`source::oda`).
 //!
 //! The file is hostile: counts are bounded, block nesting is cut off (and cycles refused), and an
 //! entity that can't be read is skipped and counted.
