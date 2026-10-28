@@ -143,7 +143,8 @@ fn split(pts: &[Coord], cuts: &[f64]) -> Vec<(f64, Vec<Coord>)> {
 
 /// Whether two lines run through the same points (either way round).
 fn same_line(a: &[Coord], b: &[Coord]) -> bool {
-    a.len() == b.len() && (a.iter().zip(b).all(|(p, q)| dist(*p, *q) < SAME) || a.iter().zip(b.iter().rev()).all(|(p, q)| dist(*p, *q) < SAME))
+    a.len() == b.len()
+        && (a.iter().zip(b).all(|(p, q)| dist(*p, *q) < SAME) || a.iter().zip(b.iter().rev()).all(|(p, q)| dist(*p, *q) < SAME))
 }
 
 /// The drawing's own fields (`rustgis_data::dxf`): not copied from nodes onto the lines.
@@ -366,7 +367,9 @@ fn read_nodes(ds: Option<&Dataset>, name_field: &str, plane: &Aeqd, capped: &mut
         }
         nodes.push(Node { at: plane.forward(*c), row: r, name: ni.map(|i| text_of(ds.value(r, i))).unwrap_or_default() });
     }
-    let copied = (0..ds.fields.len()).filter(|i| ds.fields.get(*i).is_some_and(|f| !CAD_FIELDS.iter().any(|c| c.eq_ignore_ascii_case(&f.name)))).collect();
+    let copied = (0..ds.fields.len())
+        .filter(|i| ds.fields.get(*i).is_some_and(|f| !CAD_FIELDS.iter().any(|c| c.eq_ignore_ascii_case(&f.name))))
+        .collect();
     Ok((nodes, copied))
 }
 
@@ -424,7 +427,11 @@ pub fn network(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let mut capped = false;
     let runs = read_runs(inp, name, lines, &patterns, &plane, &mut capped);
     if runs.is_empty() {
-        return Err(if patterns.is_empty() { format!("'{name}' has no lines") } else { format!("'{name}' has no lines on CAD layers '{}'", text(p, "layers")) });
+        return Err(if patterns.is_empty() {
+            format!("'{name}' has no lines")
+        } else {
+            format!("'{name}' has no lines on CAD layers '{}'", text(p, "layers"))
+        });
     }
     let (nodes, node_fields) = read_nodes(nodes_ds, text(p, "nodeName"), &plane, &mut capped)?;
     let dims = read_dims(dims_ds, &plane, &mut capped)?;
@@ -570,7 +577,14 @@ impl Net {
                     if at_end || self.overshoots.iter().any(|p| near(*p)) || self.nodes.iter().any(|n| near(n.at)) {
                         continue;
                     }
-                    if self.book.note("crossing", x, None, Some(row), "crosses another line with no node: pipes at different depths?".into(), Level::Ask) {
+                    if self.book.note(
+                        "crossing",
+                        x,
+                        None,
+                        Some(row),
+                        "crosses another line with no node: pipes at different depths?".into(),
+                        Level::Ask,
+                    ) {
                         if let Some(a) = self.runs.get_mut(i) {
                             a.cuts.push(sa);
                         }
@@ -600,7 +614,14 @@ impl Net {
                 .filter_map(|(i, r)| foot(&r.pts, n.at).map(|f| (i, f)))
                 .min_by(|a, b| a.1.0.total_cmp(&b.1.0));
             let Some((i, (d, s, q))) = best.filter(|(_, (d, ..))| *d <= self.ask) else {
-                self.book.note("stray_node", n.at, None, None, format!("{} is more than {} m from every line", n.name, self.ask), Level::Report);
+                self.book.note(
+                    "stray_node",
+                    n.at,
+                    None,
+                    None,
+                    format!("{} is more than {} m from every line", n.name, self.ask),
+                    Level::Report,
+                );
                 continue;
             };
             let Some(run) = self.runs.get(i) else { continue };
@@ -609,7 +630,8 @@ impl Net {
             if s < self.snap || len - s < self.snap {
                 continue;
             }
-            let cut = d < self.snap || self.book.note("node_off_line", n.at, Some(q), Some(row), format!("{} is {d:.2} m off the line", n.name), Level::Ask);
+            let cut = d < self.snap
+                || self.book.note("node_off_line", n.at, Some(q), Some(row), format!("{} is {d:.2} m off the line", n.name), Level::Ask);
             if cut {
                 if let Some(run) = self.runs.get_mut(i) {
                     run.cuts.push(s);
@@ -694,8 +716,10 @@ impl Net {
             for (start, pts) in split(&run.pts, &cuts) {
                 let end = start + length(&pts);
                 let at_node = |p: Option<&Coord>| {
-                    p.and_then(|p| self.anchors.iter().map(|(a, k)| (dist(*a, *p), *k)).filter(|(d, _)| *d <= reach).min_by(|a, b| a.0.total_cmp(&b.0)))
-                        .and_then(|(_, k)| self.nodes.get(k))
+                    p.and_then(|p| {
+                        self.anchors.iter().map(|(a, k)| (dist(*a, *p), *k)).filter(|(d, _)| *d <= reach).min_by(|a, b| a.0.total_cmp(&b.0))
+                    })
+                    .and_then(|(_, k)| self.nodes.get(k))
                 };
                 let ends = [at_node(pts.first()), at_node(pts.last())];
                 let noted = self
@@ -733,13 +757,27 @@ impl Net {
                 if let Some(n) = noted
                     && (drawn - n).abs() > tolerance
                 {
-                    self.book.note("length_mismatch", mid, None, row, format!("drawn {drawn:.2} m, its dimension says {n:.2} m"), Level::Report);
+                    self.book.note(
+                        "length_mismatch",
+                        mid,
+                        None,
+                        row,
+                        format!("drawn {drawn:.2} m, its dimension says {n:.2} m"),
+                        Level::Report,
+                    );
                 }
                 if !self.nodes.is_empty() && no_node {
                     self.book.note("piece_without_node", mid, None, row, "no node at either end".into(), Level::Report);
                 }
                 if !self.dims.is_empty() && noted.is_none() {
-                    self.book.note("piece_without_dimension", mid, None, row, format!("{drawn:.2} m drawn; no dimension gives its length"), Level::Report);
+                    self.book.note(
+                        "piece_without_dimension",
+                        mid,
+                        None,
+                        row,
+                        format!("{drawn:.2} m drawn; no dimension gives its length"),
+                        Level::Report,
+                    );
                 }
             }
         }
@@ -748,13 +786,21 @@ impl Net {
 
     /// The findings as points: kind, note, confidence, decision, the input line's id.
     fn proposals_layer(&self, lines: &Dataset, plane: &Aeqd) -> Dataset {
-        let mut fields: Vec<Field> = ["kind", "note", "confidence", "decision"].into_iter().map(|n| Field::new(n, FieldType::Text)).collect();
+        let mut fields: Vec<Field> =
+            ["kind", "note", "confidence", "decision"].into_iter().map(|n| Field::new(n, FieldType::Text)).collect();
         fields.push(Field::new("line", FieldType::Integer));
         let mut out = Dataset::new(format!("{} proposals", lines.name), GeometryType::Point, fields);
         out.crs = lines.crs;
         for f in &self.book.found {
-            let line = f.line.and_then(|r| lines.features.get(r)).and_then(|ft| i64::try_from(ft.id).ok()).map(Value::Int).unwrap_or(Value::Null);
-            let attrs = vec![Value::Text(f.kind.into()), Value::Text(f.note.clone()), Value::Text(f.level.label().into()), Value::Text(f.decision.into()), line];
+            let line =
+                f.line.and_then(|r| lines.features.get(r)).and_then(|ft| i64::try_from(ft.id).ok()).map(Value::Int).unwrap_or(Value::Null);
+            let attrs = vec![
+                Value::Text(f.kind.into()),
+                Value::Text(f.note.clone()),
+                Value::Text(f.level.label().into()),
+                Value::Text(f.decision.into()),
+                line,
+            ];
             out.push_next(Some(Geometry::Point(plane.inverse(f.at))), attrs);
         }
         out
@@ -825,7 +871,10 @@ mod tests {
         let fields = vec![Field::new("layer", FieldType::Text), Field::new("TEN", FieldType::Text), Field::new("TK", FieldType::Double)];
         let mut d = Dataset::new("nodes", GeometryType::Point, fields);
         for (i, (name, x, y)) in ns.iter().enumerate() {
-            d.push(Some(Geometry::Point(m(*x, *y))), vec![Value::Text("T-HO GA".into()), Value::Text((*name).into()), Value::Float(3.0 + i as f64)]);
+            d.push(
+                Some(Geometry::Point(m(*x, *y))),
+                vec![Value::Text("T-HO GA".into()), Value::Text((*name).into()), Value::Float(3.0 + i as f64)],
+            );
         }
         d
     }
@@ -835,7 +884,10 @@ mod tests {
         let fields = vec![Field::new("entity", FieldType::Text), Field::new("measure", FieldType::Double)];
         let mut d = Dataset::new("dims", GeometryType::Polyline, fields);
         for (a, b, measure) in ds {
-            d.push(Some(Geometry::Line(vec![vec![m(a.0, a.1), m(b.0, b.1)]])), vec![Value::Text("DIMENSION".into()), Value::Float(*measure)]);
+            d.push(
+                Some(Geometry::Line(vec![vec![m(a.0, a.1), m(b.0, b.1)]])),
+                vec![Value::Text("DIMENSION".into()), Value::Float(*measure)],
+            );
         }
         d
     }
@@ -912,7 +964,10 @@ mod tests {
     #[test]
     fn pieces_take_their_end_nodes_and_lengths() {
         let (net, props) = run(
-            vec![lines(&[("ONG 300", &[(0.0, 0.0), (60.0, 0.0), (60.0, 40.0)]), ("ONG 500", &[(0.0, 100.0), (50.0, 100.0)])]), nodes(&[("A1", 0.0, 0.0), ("A2", 60.0, 40.0)])],
+            vec![
+                lines(&[("ONG 300", &[(0.0, 0.0), (60.0, 0.0), (60.0, 40.0)]), ("ONG 500", &[(0.0, 100.0), (50.0, 100.0)])]),
+                nodes(&[("A1", 0.0, 0.0), ("A2", 60.0, 40.0)]),
+            ],
             serde_json::json!({"lines": "lines", "layers": "ONG 3*", "nodes": "nodes"}),
         );
         assert_eq!((net.name.as_str(), net.features.len()), ("lines network", 1), "only the CAD layers asked for");
@@ -934,8 +989,12 @@ mod tests {
         assert!(error(vec![base(), no_measure], serde_json::json!({"lines": "lines", "dimensions": "dims"})).contains("'measure'"));
         let mut not_proposals = nodes(&[]);
         not_proposals.name = "props".into();
-        assert!(error(vec![base(), not_proposals], serde_json::json!({"lines": "lines", "proposals": "props"})).contains("proposals layer"));
-        assert!(error(vec![base(), nodes(&[])], serde_json::json!({"lines": "lines", "nodes": "nodes", "nodeName": "NAME"})).contains("'NAME'"));
+        assert!(
+            error(vec![base(), not_proposals], serde_json::json!({"lines": "lines", "proposals": "props"})).contains("proposals layer")
+        );
+        assert!(
+            error(vec![base(), nodes(&[])], serde_json::json!({"lines": "lines", "nodes": "nodes", "nodeName": "NAME"})).contains("'NAME'")
+        );
         assert!(error(vec![base()], serde_json::json!({"lines": "lines", "layers": "DAT_*"})).contains("DAT_*"));
         assert!(error(vec![base()], serde_json::json!({"lines": "nope"})).contains("nope"));
         // Junk numbers fall back to the defaults or are clamped.
@@ -1038,7 +1097,13 @@ mod tests {
     /// from the first, both ends 0.1 m off the run.
     #[test]
     fn a_dimension_ending_mid_line_cuts_it_when_accepted() {
-        let layers = || vec![lines(&[("ONG 500", &[(0.0, 0.0), (195.87, 0.0)])]), nodes(&[("A1", 0.0, 0.0), ("A2", 195.87, 0.0)]), dims(&[((0.0, 0.1), (130.29, 0.1), 130.29)])];
+        let layers = || {
+            vec![
+                lines(&[("ONG 500", &[(0.0, 0.0), (195.87, 0.0)])]),
+                nodes(&[("A1", 0.0, 0.0), ("A2", 195.87, 0.0)]),
+                dims(&[((0.0, 0.1), (130.29, 0.1), 130.29)]),
+            ]
+        };
         let p = serde_json::json!({"lines": "lines", "nodes": "nodes", "dimensions": "dims"});
         let (net, props) = run(layers(), p.clone());
         assert_eq!(net.features.len(), 1);
