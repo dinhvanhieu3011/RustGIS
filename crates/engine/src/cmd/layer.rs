@@ -910,6 +910,7 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
                 crs: crs.map(rustgis_data::raster::Crs::parse).transpose()?,
                 layer: ps(p, "layer").map(str::trim).filter(|l| !l.is_empty()),
                 paper_space: b(p, "paperSpace").unwrap_or(false),
+                attribs_as_points: false,
             };
             rustgis_data::dxf::read(file_name, bytes, &opts)
                 .map_err(|e| e.to_string())?
