@@ -146,12 +146,521 @@ fn same_line(a: &[Coord], b: &[Coord]) -> bool {
     a.len() == b.len() && (a.iter().zip(b).all(|(p, q)| dist(*p, *q) < SAME) || a.iter().zip(b.iter().rev()).all(|(p, q)| dist(*p, *q) < SAME))
 }
 
+/// The drawing's own fields (`rustgis_data::dxf`): not copied from nodes onto the lines.
+const CAD_FIELDS: [&str; 10] = ["layer", "entity", "color", "linetype", "text", "height", "rotation", "block", "elevation", "paperspace"];
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Text(t) => t.clone(),
+        v => v.to_string(),
+    }
+}
+
+fn text<'a>(p: &'a Json, k: &str) -> &'a str {
+    p.get(k).and_then(Json::as_str).unwrap_or("").trim()
+}
+
+/// An optional layer parameter.
+fn layer<'a>(inp: &'a dyn Inputs, p: &Json, k: &str) -> Result<Option<&'a Dataset>, String> {
+    match text(p, k) {
+        "" => Ok(None),
+        n => inp.dataset(n).map(Some).ok_or_else(|| format!("no layer named '{n}'")),
+    }
+}
+
+fn lonlat(e: &Extent) -> bool {
+    e.is_empty() || (e.min_x >= -180.0 && e.max_x <= 180.0 && e.min_y >= -90.0 && e.max_y <= 90.0)
+}
+
+fn is_dimension(d: &Dataset, entity: Option<usize>, row: usize) -> bool {
+    entity.is_some_and(|i| matches!(d.value(row, i), Value::Text(t) if t.eq_ignore_ascii_case("DIMENSION")))
+}
+
+/// One part of an input line, on the plane.
+struct Run {
+    row: usize,
+    layer: String,
+    pts: Vec<Coord>,
+    /// Where it is cut, as distances along it.
+    cuts: Vec<f64>,
+    /// Dropped (a duplicate).
+    gone: bool,
+}
+
+struct Node {
+    at: Coord,
+    row: usize,
+    name: String,
+}
+
+struct Dim {
+    a: Coord,
+    b: Coord,
+    measure: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Level {
+    /// Certain: fixed unless an earlier run's proposal skipped it.
+    Fixed,
+    /// Proposed: fixed when accepted.
+    Ask,
+    /// Reported: nothing to fix.
+    Report,
+}
+
+impl Level {
+    fn label(self) -> &'static str {
+        match self {
+            Level::Fixed => "fixed",
+            Level::Ask => "ask",
+            Level::Report => "report",
+        }
+    }
+}
+
+struct Finding {
+    kind: &'static str,
+    at: Coord,
+    /// Where the fix moves `at` to, for a gap or an overshoot.
+    to: Option<Coord>,
+    /// The input line's row.
+    line: Option<usize>,
+    note: String,
+    level: Level,
+    decision: &'static str,
+}
+
+/// An earlier run's decided proposals: kind, where, `accept` or `skip`.
+#[derive(Default)]
+struct Decisions(Vec<(String, Coord, &'static str)>);
+
+impl Decisions {
+    fn read(d: &Dataset, plane: &Aeqd) -> Result<Decisions, String> {
+        let (Some(k), Some(dc)) = (d.field_index("kind"), d.field_index("decision")) else {
+            return Err(format!("'{}' isn't a proposals layer: it has no 'kind' and 'decision' fields", d.name));
+        };
+        let mut v = Vec::new();
+        for (r, f) in d.features.iter().enumerate().take(MAX_FINDINGS) {
+            let Some(Geometry::Point(c)) = &f.geometry else { continue };
+            let decision = match text_of(d.value(r, dc)).trim().to_ascii_lowercase().as_str() {
+                "accept" => "accept",
+                "skip" => "skip",
+                _ => continue,
+            };
+            v.push((text_of(d.value(r, k)), plane.forward(*c), decision));
+        }
+        Ok(Decisions(v))
+    }
+
+    fn get(&self, kind: &str, at: Coord, tol: f64) -> Option<&'static str> {
+        self.0
+            .iter()
+            .filter(|(k, p, _)| k.eq_ignore_ascii_case(kind) && dist(*p, at) <= tol)
+            .min_by(|a, b| dist(a.1, at).total_cmp(&dist(b.1, at)))
+            .map(|(_, _, d)| *d)
+    }
+}
+
+/// What a run found.
+struct Book {
+    found: Vec<Finding>,
+    prior: Decisions,
+    /// How near an earlier proposal, or one already found, counts as the same place.
+    tol: f64,
+    dropped: usize,
+}
+
+impl Book {
+    /// Records a finding and says whether to make its fix: a certain one unless an earlier
+    /// run's proposal skipped it, a proposed one when accepted. A finding already recorded (a
+    /// gap seen from its other end) is recorded once.
+    fn note(&mut self, kind: &'static str, at: Coord, to: Option<Coord>, line: Option<usize>, note: String, level: Level) -> bool {
+        let tol = self.tol;
+        let same = |f: &&Finding| {
+            f.kind == kind && (dist(f.at, at) <= tol || f.to.zip(to).is_some_and(|(ft, t)| dist(ft, at) <= tol && dist(f.at, t) <= tol))
+        };
+        if let Some(f) = self.found.iter().find(same) {
+            return f.decision == "accept";
+        }
+        let decision = match (level, self.prior.get(kind, at, tol)) {
+            (Level::Report, _) => "",
+            (_, Some(d)) => d,
+            (Level::Fixed, None) => "accept",
+            (Level::Ask, None) => "",
+        };
+        if self.found.len() < MAX_FINDINGS {
+            self.found.push(Finding { kind, at, to, line, note, level, decision });
+        } else {
+            self.dropped += 1;
+        }
+        decision == "accept"
+    }
+}
+
+/// The network being built, on the plane.
+struct Net {
+    runs: Vec<Run>,
+    nodes: Vec<Node>,
+    dims: Vec<Dim>,
+    snap: f64,
+    ask: f64,
+    book: Book,
+    work: usize,
+    /// Where overshoots were found (fixed or not): crossings there aren't mid-line.
+    overshoots: Vec<Coord>,
+    /// Where nodes sit: each node's position, and the foot of a node off a line whose cut was
+    /// accepted; with the node's index.
+    anchors: Vec<(Coord, usize)>,
+    /// Dimensions on lines: dimension index, run index, from and to along the run.
+    on: Vec<(usize, usize, f64, f64)>,
+}
+
+fn read_runs(inp: &dyn Inputs, name: &str, lines: &Dataset, patterns: &[&str], plane: &Aeqd, capped: &mut bool) -> Vec<Run> {
+    let (li, ei) = (lines.field_index("layer"), lines.field_index("entity"));
+    let selected = inp.selection(name);
+    let rows: Vec<usize> = if selected.is_empty() {
+        (0..lines.features.len()).collect()
+    } else {
+        selected.iter().copied().filter(|r| *r < lines.features.len()).collect()
+    };
+    let mut runs = Vec::new();
+    for r in rows {
+        // A dimension's lines are what it measures, not a pipe.
+        if is_dimension(lines, ei, r) {
+            continue;
+        }
+        let layer = li.map(|i| text_of(lines.value(r, i))).unwrap_or_default();
+        if !patterns.is_empty() && !patterns.iter().any(|p| crate::cad::matches(p, &layer)) {
+            continue;
+        }
+        let Some(Geometry::Line(parts)) = lines.features.get(r).and_then(|f| f.geometry.as_ref()) else { continue };
+        for part in parts {
+            if runs.len() >= MAX_ITEMS {
+                *capped = true;
+                return runs;
+            }
+            let pts: Vec<Coord> = part.iter().map(|c| plane.forward(*c)).collect();
+            if length(&pts) > SAME {
+                runs.push(Run { row: r, layer: layer.clone(), pts, cuts: Vec::new(), gone: false });
+            }
+        }
+    }
+    runs
+}
+
+/// The nodes, named by `name_field` (else `TEN`, else `A`), and the fields copied from them.
+fn read_nodes(ds: Option<&Dataset>, name_field: &str, plane: &Aeqd, capped: &mut bool) -> Result<(Vec<Node>, Vec<usize>), String> {
+    let Some(ds) = ds else { return Ok((Vec::new(), Vec::new())) };
+    let ni = match name_field {
+        "" => ds.field_index("TEN").or_else(|| ds.field_index("A")),
+        f => Some(ds.field_index(f).ok_or_else(|| format!("'{}' has no field '{f}'", ds.name))?),
+    };
+    let mut nodes = Vec::new();
+    for (r, f) in ds.features.iter().enumerate() {
+        let Some(Geometry::Point(c)) = &f.geometry else { continue };
+        if nodes.len() >= MAX_ITEMS {
+            *capped = true;
+            break;
+        }
+        nodes.push(Node { at: plane.forward(*c), row: r, name: ni.map(|i| text_of(ds.value(r, i))).unwrap_or_default() });
+    }
+    let copied = (0..ds.fields.len()).filter(|i| ds.fields.get(*i).is_some_and(|f| !CAD_FIELDS.iter().any(|c| c.eq_ignore_ascii_case(&f.name)))).collect();
+    Ok((nodes, copied))
+}
+
+/// The dimensions: lines with a `measure` (and, when there's an `entity` field, DIMENSION).
+fn read_dims(ds: Option<&Dataset>, plane: &Aeqd, capped: &mut bool) -> Result<Vec<Dim>, String> {
+    let Some(ds) = ds else { return Ok(Vec::new()) };
+    let mi = ds.field_index("measure").ok_or_else(|| {
+        format!("'{}' has no 'measure' field: give the lines layer of a drawing with dimensions (add the drawing again if it was added before dimensions were read)", ds.name)
+    })?;
+    let ei = ds.field_index("entity");
+    let mut dims = Vec::new();
+    for (r, f) in ds.features.iter().enumerate() {
+        if ei.is_some() && !is_dimension(ds, ei, r) {
+            continue;
+        }
+        let Some(Geometry::Line(parts)) = &f.geometry else { continue };
+        let (Some(a), Some(b)) = (parts.first().and_then(|p| p.first()), parts.first().and_then(|p| p.last())) else { continue };
+        let Some(measure) = ds.value(r, mi).as_f64().filter(|m| *m > 0.0) else { continue };
+        if dims.len() >= MAX_ITEMS {
+            *capped = true;
+            break;
+        }
+        dims.push(Dim { a: plane.forward(*a), b: plane.forward(*b), measure });
+    }
+    Ok(dims)
+}
+
+/// `cadNetwork`: see the module.
+pub fn network(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    let number = |k: &str, d: f64| {
+        p.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str()?.trim().parse().ok())).filter(|v: &f64| v.is_finite()).unwrap_or(d)
+    };
+    let snap = number("snap", 0.5).clamp(0.0, 100.0);
+    let ask = number("ask", 10.0).clamp(snap, 1000.0);
+    let tolerance = number("lengthTolerance", 0.5).clamp(0.0, 1e6);
+    let name = text(p, "lines");
+    let lines = inp.dataset(name).ok_or_else(|| format!("no layer named '{name}'"))?;
+    let nodes_ds = layer(inp, p, "nodes")?;
+    let dims_ds = layer(inp, p, "dimensions")?;
+    for d in [Some(lines), nodes_ds, dims_ds].into_iter().flatten() {
+        if !lonlat(&d.extent()) {
+            return Err(format!(
+                "'{}' isn't in longitude/latitude: add the drawing with its coordinate system (\"crs\": EPSG:3405 for VN-2000 / UTM zone 48N, or the province's VN-2000 TM-3 +proj string)",
+                d.name
+            ));
+        }
+    }
+    let ext = lines.extent();
+    let plane = Aeqd::new(Coord::new((ext.min_x + ext.max_x) / 2.0, (ext.min_y + ext.max_y) / 2.0));
+    let prior = match layer(inp, p, "proposals")? {
+        Some(d) => Decisions::read(d, &plane)?,
+        None => Decisions::default(),
+    };
+    let patterns: Vec<&str> = text(p, "layers").split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let mut capped = false;
+    let runs = read_runs(inp, name, lines, &patterns, &plane, &mut capped);
+    if runs.is_empty() {
+        return Err(if patterns.is_empty() { format!("'{name}' has no lines") } else { format!("'{name}' has no lines on CAD layers '{}'", text(p, "layers")) });
+    }
+    let (nodes, node_fields) = read_nodes(nodes_ds, text(p, "nodeName"), &plane, &mut capped)?;
+    let dims = read_dims(dims_ds, &plane, &mut capped)?;
+    let anchors = nodes.iter().enumerate().map(|(k, n)| (n.at, k)).collect();
+    let book = Book { found: Vec::new(), prior, tol: snap.max(0.05), dropped: 0 };
+    let mut net = Net { runs, nodes, dims, snap, ask, book, work: 0, overshoots: Vec::new(), anchors, on: Vec::new() };
+    let network = net.network_layer(lines, nodes_ds, &node_fields, tolerance, &plane);
+    let proposals = net.proposals_layer(lines, &plane);
+    let messages = net.summary(network.features.len(), capped);
+    Ok(ToolResult { output: Output::Layers(vec![OutputLayer::Vector(network), OutputLayer::Vector(proposals)]), messages })
+}
+
+impl Net {
+    /// The network: each line cut into its pieces, with the nodes at their ends, the length a
+    /// dimension notes and the length drawn. Pieces whose length disagrees, or that lack a node
+    /// or a dimension, are reported.
+    fn network_layer(&mut self, lines: &Dataset, nodes: Option<&Dataset>, node_fields: &[usize], tolerance: f64, plane: &Aeqd) -> Dataset {
+        let mut fields = lines.fields.clone();
+        let base = fields.len();
+        fields.push(Field::new("node1", FieldType::Text));
+        fields.push(Field::new("node2", FieldType::Text));
+        let copied: Vec<&Field> = node_fields.iter().filter_map(|i| nodes.and_then(|n| n.fields.get(*i))).collect();
+        for prefix in ["n1_", "n2_"] {
+            for f in &copied {
+                let mut f = (*f).clone();
+                f.name = format!("{prefix}{}", f.name);
+                fields.push(f);
+            }
+        }
+        for name in ["len_drawn", "len_noted", "len_diff"] {
+            fields.push(Field::new(name, FieldType::Double));
+        }
+        let mut out = Dataset::new(format!("{} network", lines.name), GeometryType::Polyline, fields);
+        out.crs = lines.crs;
+        let reach = self.snap.max(SAME);
+        let runs = std::mem::take(&mut self.runs);
+        for (i, run) in runs.iter().enumerate().filter(|(_, r)| !r.gone) {
+            let len = length(&run.pts);
+            let mut cuts: Vec<f64> = run.cuts.iter().copied().filter(|c| *c > SAME && len - *c > SAME).collect();
+            cuts.sort_by(f64::total_cmp);
+            cuts.dedup_by(|a, b| (*a - *b).abs() < SAME);
+            let Some(attrs) = lines.features.get(run.row).map(|f| &f.attrs) else { continue };
+            for (start, pts) in split(&run.pts, &cuts) {
+                let end = start + length(&pts);
+                let at_node = |p: Option<&Coord>| {
+                    p.and_then(|p| self.anchors.iter().map(|(a, k)| (dist(*a, *p), *k)).filter(|(d, _)| *d <= reach).min_by(|a, b| a.0.total_cmp(&b.0)))
+                        .and_then(|(_, k)| self.nodes.get(k))
+                };
+                let ends = [at_node(pts.first()), at_node(pts.last())];
+                let noted = self
+                    .on
+                    .iter()
+                    .find(|(_, r, lo, hi)| *r == i && (lo - start).abs() < reach && (hi - end).abs() < reach)
+                    .and_then(|(k, ..)| self.dims.get(*k))
+                    .map(|d| d.measure);
+                let ll: Vec<Coord> = pts.iter().map(|c| plane.inverse(*c)).collect();
+                let drawn: f64 = ll
+                    .windows(2)
+                    .map(|w| match w {
+                        [a, b] => wgs84_distance_m(*a, *b),
+                        _ => 0.0,
+                    })
+                    .sum();
+                let mut a = attrs.clone();
+                a.resize(base, Value::Null);
+                for n in ends {
+                    a.push(n.map(|n| Value::Text(n.name.clone())).unwrap_or(Value::Null));
+                }
+                for n in ends {
+                    for &fi in node_fields {
+                        a.push(match (n, nodes) {
+                            (Some(n), Some(ds)) => ds.value(n.row, fi).clone(),
+                            _ => Value::Null,
+                        });
+                    }
+                }
+                a.push(Value::Float(drawn));
+                a.push(noted.map(Value::Float).unwrap_or(Value::Null));
+                a.push(noted.map(|n| Value::Float(drawn - n)).unwrap_or(Value::Null));
+                out.push_next(Some(Geometry::Line(vec![ll])), a);
+                let (mid, row, no_node) = (point_at(&pts, (end - start) / 2.0), Some(run.row), ends.iter().all(Option::is_none));
+                if let Some(n) = noted
+                    && (drawn - n).abs() > tolerance
+                {
+                    self.book.note("length_mismatch", mid, None, row, format!("drawn {drawn:.2} m, its dimension says {n:.2} m"), Level::Report);
+                }
+                if !self.nodes.is_empty() && no_node {
+                    self.book.note("piece_without_node", mid, None, row, "no node at either end".into(), Level::Report);
+                }
+                if !self.dims.is_empty() && noted.is_none() {
+                    self.book.note("piece_without_dimension", mid, None, row, format!("{drawn:.2} m drawn; no dimension gives its length"), Level::Report);
+                }
+            }
+        }
+        out
+    }
+
+    /// The findings as points: kind, note, confidence, decision, the input line's id.
+    fn proposals_layer(&self, lines: &Dataset, plane: &Aeqd) -> Dataset {
+        let mut fields: Vec<Field> = ["kind", "note", "confidence", "decision"].into_iter().map(|n| Field::new(n, FieldType::Text)).collect();
+        fields.push(Field::new("line", FieldType::Integer));
+        let mut out = Dataset::new(format!("{} proposals", lines.name), GeometryType::Point, fields);
+        out.crs = lines.crs;
+        for f in &self.book.found {
+            let line = f.line.and_then(|r| lines.features.get(r)).and_then(|ft| i64::try_from(ft.id).ok()).map(Value::Int).unwrap_or(Value::Null);
+            let attrs = vec![Value::Text(f.kind.into()), Value::Text(f.note.clone()), Value::Text(f.level.label().into()), Value::Text(f.decision.into()), line];
+            out.push_next(Some(Geometry::Point(plane.inverse(f.at))), attrs);
+        }
+        out
+    }
+
+    fn summary(&self, pieces: usize, capped: bool) -> Vec<String> {
+        let f = &self.book.found;
+        let n = |level: Level, decision: &str| f.iter().filter(|x| x.level == level && x.decision == decision).count();
+        let open = n(Level::Ask, "");
+        let reported = f.iter().filter(|x| x.level == Level::Report).count();
+        let mut m = vec![format!(
+            "{pieces} pieces: {} fixes made, {} proposals accepted, {open} to decide, {reported} reported",
+            n(Level::Fixed, "accept"),
+            n(Level::Ask, "accept")
+        )];
+        if open > 0 {
+            m.push("to decide: set 'decision' to accept or skip in the proposals layer, then run again with it as 'proposals'".into());
+        }
+        if self.book.dropped > 0 {
+            m.push(format!("{} more findings weren't written: at most {MAX_FINDINGS}", self.book.dropped));
+        }
+        if self.work > MAX_WORK {
+            m.push("the lines are too many to check whole: some ends, crossings and nodes weren't checked".into());
+        }
+        if capped {
+            m.push(format!("more than {MAX_ITEMS} lines, nodes or dimensions: the rest were left out"));
+        }
+        m
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn c(x: f64, y: f64) -> Coord {
         Coord::new(x, y)
+    }
+
+    /// Where the test lines are: metres east and north of here.
+    const AT: Coord = Coord { x: 105.9, y: 20.9 };
+
+    /// A point `x`, `y` metres east and north of [`AT`], as longitude/latitude.
+    fn m(x: f64, y: f64) -> Coord {
+        Aeqd::new(AT).inverse(Coord::new(x, y))
+    }
+
+    struct Layers(Vec<Dataset>);
+    impl Inputs for Layers {
+        fn dataset(&self, layer: &str) -> Option<&Dataset> {
+            self.0.iter().find(|d| d.name == layer)
+        }
+        fn selection(&self, _: &str) -> &[usize] {
+            &[]
+        }
+    }
+
+    fn lines(runs: &[(&str, &[(f64, f64)])]) -> Dataset {
+        let mut d = Dataset::new("lines", GeometryType::Polyline, vec![Field::new("layer", FieldType::Text)]);
+        for (layer, pts) in runs {
+            d.push(Some(Geometry::Line(vec![pts.iter().map(|(x, y)| m(*x, *y)).collect()])), vec![Value::Text((*layer).into())]);
+        }
+        d
+    }
+
+    /// Manholes: named, with a level 3, 4, 5… in `TK`.
+    fn nodes(ns: &[(&str, f64, f64)]) -> Dataset {
+        let fields = vec![Field::new("layer", FieldType::Text), Field::new("TEN", FieldType::Text), Field::new("TK", FieldType::Double)];
+        let mut d = Dataset::new("nodes", GeometryType::Point, fields);
+        for (i, (name, x, y)) in ns.iter().enumerate() {
+            d.push(Some(Geometry::Point(m(*x, *y))), vec![Value::Text("T-HO GA".into()), Value::Text((*name).into()), Value::Float(3.0 + i as f64)]);
+        }
+        d
+    }
+
+    /// Dimensions: from, to, the length they measure.
+    fn dims(ds: &[((f64, f64), (f64, f64), f64)]) -> Dataset {
+        let fields = vec![Field::new("entity", FieldType::Text), Field::new("measure", FieldType::Double)];
+        let mut d = Dataset::new("dims", GeometryType::Polyline, fields);
+        for (a, b, measure) in ds {
+            d.push(Some(Geometry::Line(vec![vec![m(a.0, a.1), m(b.0, b.1)]])), vec![Value::Text("DIMENSION".into()), Value::Float(*measure)]);
+        }
+        d
+    }
+
+    /// Runs the tool: the network and the proposals.
+    fn run(layers: Vec<Dataset>, p: Json) -> (Dataset, Dataset) {
+        match network(&Layers(layers), &p).unwrap().output {
+            Output::Layers(v) => match <[OutputLayer; 2]>::try_from(v) {
+                Ok([OutputLayer::Vector(n), OutputLayer::Vector(p)]) => (n, p),
+                v => panic!("{v:?}"),
+            },
+            o => panic!("{o:?}"),
+        }
+    }
+
+    fn error(layers: Vec<Dataset>, p: Json) -> String {
+        match network(&Layers(layers), &p) {
+            Err(e) => e,
+            Ok(r) => panic!("expected an error: {:?}", r.messages),
+        }
+    }
+
+    /// The findings of a kind: (confidence, decision) each.
+    fn found(props: &Dataset, kind: &str) -> Vec<(String, String)> {
+        let f = |n: &str| props.field_index(n).unwrap();
+        (0..props.features.len())
+            .filter(|r| text_of(props.value(*r, f("kind"))) == kind)
+            .map(|r| (text_of(props.value(r, f("confidence"))), text_of(props.value(r, f("decision")))))
+            .collect()
+    }
+
+    /// The proposals with every one of `kind` decided `decision`, as layer `props`.
+    fn decide(mut props: Dataset, kind: &str, decision: &str) -> Dataset {
+        let (k, d) = (props.field_index("kind").unwrap(), props.field_index("decision").unwrap());
+        for f in props.features.iter_mut() {
+            if f.attrs[k] == Value::Text(kind.into()) {
+                f.attrs[d] = Value::Text(decision.into());
+            }
+        }
+        props.name = "props".into();
+        props
+    }
+
+    fn number(d: &Dataset, row: usize, field: &str) -> f64 {
+        d.value(row, d.field_index(field).unwrap()).as_f64().unwrap()
+    }
+
+    fn txt(d: &Dataset, row: usize, field: &str) -> String {
+        text_of(d.value(row, d.field_index(field).unwrap()))
     }
 
     #[test]
@@ -174,5 +683,39 @@ mod tests {
         assert_eq!(split(&l, &[]).len(), 1);
         assert!(same_line(&l, &[c(60.0, 40.0), c(60.0, 0.0), c(0.0, 0.0)]));
         assert!(!same_line(&l, &l[..2]));
+    }
+
+    #[test]
+    fn pieces_take_their_end_nodes_and_lengths() {
+        let (net, props) = run(
+            vec![lines(&[("ONG 300", &[(0.0, 0.0), (60.0, 0.0), (60.0, 40.0)]), ("ONG 500", &[(0.0, 100.0), (50.0, 100.0)])]), nodes(&[("A1", 0.0, 0.0), ("A2", 60.0, 40.0)])],
+            serde_json::json!({"lines": "lines", "layers": "ONG 3*", "nodes": "nodes"}),
+        );
+        assert_eq!((net.name.as_str(), net.features.len()), ("lines network", 1), "only the CAD layers asked for");
+        assert!((number(&net, 0, "len_drawn") - 100.0).abs() < 1e-3);
+        assert_eq!((txt(&net, 0, "node1"), txt(&net, 0, "node2")), ("A1".into(), "A2".into()));
+        assert_eq!((number(&net, 0, "n1_TK"), number(&net, 0, "n2_TK")), (3.0, 4.0));
+        assert!(net.field_index("n1_layer").is_none(), "the drawing's own fields aren't copied");
+        assert!(net.value(0, net.field_index("len_noted").unwrap()).is_null());
+        assert_eq!((props.name.as_str(), props.features.len()), ("lines proposals", 0));
+    }
+
+    #[test]
+    fn inputs_are_checked() {
+        let base = || lines(&[("ONG 300", &[(0.0, 0.0), (10.0, 0.0)])]);
+        let mut far = Dataset::new("lines", GeometryType::Polyline, vec![]);
+        far.push(Some(Geometry::Line(vec![vec![Coord::new(397294.6, 2308552.3), Coord::new(397394.6, 2308552.3)]])), vec![]);
+        assert!(error(vec![far], serde_json::json!({"lines": "lines"})).contains("crs"));
+        let no_measure = Dataset::new("dims", GeometryType::Polyline, vec![Field::new("entity", FieldType::Text)]);
+        assert!(error(vec![base(), no_measure], serde_json::json!({"lines": "lines", "dimensions": "dims"})).contains("'measure'"));
+        let mut not_proposals = nodes(&[]);
+        not_proposals.name = "props".into();
+        assert!(error(vec![base(), not_proposals], serde_json::json!({"lines": "lines", "proposals": "props"})).contains("proposals layer"));
+        assert!(error(vec![base(), nodes(&[])], serde_json::json!({"lines": "lines", "nodes": "nodes", "nodeName": "NAME"})).contains("'NAME'"));
+        assert!(error(vec![base()], serde_json::json!({"lines": "lines", "layers": "DAT_*"})).contains("DAT_*"));
+        assert!(error(vec![base()], serde_json::json!({"lines": "nope"})).contains("nope"));
+        // Junk numbers fall back to the defaults or are clamped.
+        let (net, _) = run(vec![base()], serde_json::json!({"lines": "lines", "snap": "-1", "ask": 1e308, "lengthTolerance": "x"}));
+        assert_eq!(net.features.len(), 1);
     }
 }
