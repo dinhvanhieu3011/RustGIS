@@ -57,8 +57,11 @@ pub fn split_layers(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let by_prefix = text("group").eq_ignore_ascii_case("Prefix");
     let comma = p.get("decimalComma").and_then(Json::as_bool).unwrap_or(true);
     let selected = inp.selection(name);
-    let rows: Vec<usize> =
-        if selected.is_empty() { (0..ds.features.len()).collect() } else { selected.iter().copied().filter(|r| *r < ds.features.len()).collect() };
+    let rows: Vec<usize> = if selected.is_empty() {
+        (0..ds.features.len()).collect()
+    } else {
+        selected.iter().copied().filter(|r| *r < ds.features.len()).collect()
+    };
 
     // Groups in the order first seen: their name as first written, and their rows.
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
@@ -125,8 +128,8 @@ fn subset(ds: &Dataset, rows: &[usize], name: String, comma: bool) -> Dataset {
     for &f in &keep {
         let Some(field) = ds.fields.get(f) else { continue };
         let mut field = field.clone();
-        let is_number = field.ty == FieldType::Text
-            && rows.iter().map(|&r| ds.value(r, f)).filter(|v| !blank(v)).all(|v| number(v, comma).is_some());
+        let is_number =
+            field.ty == FieldType::Text && rows.iter().map(|&r| ds.value(r, f)).filter(|v| !blank(v)).all(|v| number(v, comma).is_some());
         if is_number {
             field.ty = FieldType::Double;
         }
@@ -153,7 +156,7 @@ fn subset(ds: &Dataset, rows: &[usize], name: String, comma: bool) -> Dataset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustgis_data::{Coord, Field, GeometryType, Geometry};
+    use rustgis_data::{Coord, Field, Geometry, GeometryType};
 
     struct One(Dataset);
     impl Inputs for One {

@@ -960,7 +960,14 @@ struct Drawing {
 
 /// Reads the records of each section.
 fn drawing(records: &[Record], attribs_as_points: bool) -> Drawing {
-    let mut d = Drawing { layers: HashMap::new(), blocks: HashMap::new(), xrefs: HashMap::new(), entities: Vec::new(), unread: BTreeMap::new(), bad: 0 };
+    let mut d = Drawing {
+        layers: HashMap::new(),
+        blocks: HashMap::new(),
+        xrefs: HashMap::new(),
+        entities: Vec::new(),
+        unread: BTreeMap::new(),
+        bad: 0,
+    };
     let mut section = "";
     // The block being read: name, base point, entities, and the file it names when it is an
     // external reference.
@@ -1460,12 +1467,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             .push(format!("the drawing's blocks place more than {MAX_STEPS} entities (arrays of nested blocks): the rest are left out"));
     }
     if !out.xrefs.is_empty() {
-        let files: Vec<&str> = out
-            .xrefs
-            .keys()
-            .filter_map(|k| d.xrefs.get(k))
-            .map(|f| f.rsplit(['\\', '/']).next().unwrap_or(f))
-            .collect();
+        let files: Vec<&str> = out.xrefs.keys().filter_map(|k| d.xrefs.get(k)).map(|f| f.rsplit(['\\', '/']).next().unwrap_or(f)).collect();
         report.messages.push(format!(
             "external drawings not read ({}): {}; bind them in CAD (XREF › Bind) to include them",
             files.len(),
@@ -1798,10 +1800,13 @@ mod tests {
     fn layers_filter_and_crs() {
         // The table's layers and the entities' (layer 0: an INSERT without a layer group).
         assert_eq!(layers("a.dxf", &sample()).unwrap(), ["0", "Fill", "Labels", "Roads", "Trees"]);
-        let only = read("a.dxf", &sample(), &Options { crs: None, layer: Some("roads"), paper_space: false, attribs_as_points: false }).unwrap();
+        let only =
+            read("a.dxf", &sample(), &Options { crs: None, layer: Some("roads"), paper_space: false, attribs_as_points: false }).unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].0.features.len(), 2);
-        assert!(read("a.dxf", &sample(), &Options { crs: None, layer: Some("nope"), paper_space: false, attribs_as_points: false }).is_err());
+        assert!(
+            read("a.dxf", &sample(), &Options { crs: None, layer: Some("nope"), paper_space: false, attribs_as_points: false }).is_err()
+        );
         // Converted from a projected system: UTM 33N near its central meridian.
         let crs = Crs::parse("EPSG:32633").unwrap();
         let utm = dxf(&[(0, "SECTION"), (2, "ENTITIES"), (0, "POINT"), (10, "500000"), (20, "4649776"), (0, "ENDSEC"), (0, "EOF")]);
