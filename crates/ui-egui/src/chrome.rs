@@ -725,6 +725,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "select.rows" => Command("table.open"),
         "edit.addField" => Dialog("addField"),
         "edit.calculateField" => Dialog("calculateField"),
+        "landuse.tt12" => Dialog("landuseTt12"),
         "edit.move" | "edit.rotate" | "edit.scale" | "edit.template" | "edit.elevation" | "edit.groundToGrid" => Pane(RightPane::Editing),
         "data.domain" | "data.subtypes" | "data.attributeRule" | "data.contingentValues" | "data.relate" | "data.archiveRestore" => {
             Pane(RightPane::Design)

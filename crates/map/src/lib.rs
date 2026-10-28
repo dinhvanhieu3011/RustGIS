@@ -22,6 +22,7 @@ pub mod source;
 pub mod symbology;
 pub mod tiles;
 pub mod time;
+pub mod tt12;
 pub mod view;
 mod view_memory;
 pub mod world;
@@ -31,8 +32,8 @@ pub use color::{Ramp, RampGroup, Rgba};
 pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
-    ClassMethod, FontName, Glyph, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin, LineMark, LineMarkers,
-    LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
+    ClassMethod, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin, LineMark, LineMarkers, LineStroke,
+    Marker, Placements, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 
@@ -144,9 +145,7 @@ pub struct Layer {
     #[serde(default)]
     pub extrusion: Option<effects::Extrusion>,
     /// A line layer's stacked strokes, drawn bottom first in place of its single stroke (none:
-    /// the renderer's stroke alone). A point layer's are its marks: each stroke of markers draws
-    /// its marker at the point, bottom first, in place of the symbol's (see
-    /// [`LineStroke`]); a stroke without markers draws nothing there.
+    /// the renderer's stroke alone).
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "symbology::de_strokes")]
     pub line_strokes: Vec<symbology::LineStroke>,
     /// Draws the stacked strokes in levels (symbol levels): every feature's strokes of one
@@ -154,10 +153,10 @@ pub struct Layer {
     /// instead of cutting across them where lines meet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stroke_levels: bool,
-    /// Turns each point's marker (and its marks, their offsets with them) by the angle in a
-    /// field, as QGIS's data-defined symbol angle does.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "symbology::de_marker_rotation")]
-    pub marker_rotation: Option<symbology::MarkerRotation>,
+    /// Drawn as a Circular 12 land-use layer ([`tt12`]): at 1:[`tt12::IMAGE_SCALE`] or closer a
+    /// parcel fills with its group's image instead of its colour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tt12: bool,
     /// The scale (1:N) its symbol and label sizes are set for: drawn at another scale they grow
     /// and shrink with the map, as on paper (QGIS's reference scale). `None`: they keep their
     /// size on screen.
@@ -314,7 +313,7 @@ impl Layer {
             extrusion: None,
             line_strokes: Vec::new(),
             stroke_levels: false,
-            marker_rotation: None,
+            tt12: false,
             reference_scale: None,
             priority: 0,
             design: design::Design::default(),
@@ -505,16 +504,20 @@ impl Layer {
         Ok(ds)
     }
 
+    /// The image file and outline a Circular 12 layer's row draws with at `scale` (1:N): none
+    /// further out than [`tt12::IMAGE_SCALE`], off a Circular 12 layer, or for a code in no group.
+    pub fn tt12_image(&self, row: usize, scale: f64) -> Option<(&'static str, Rgba)> {
+        if !self.tt12 || scale.is_nan() || scale > tt12::IMAGE_SCALE {
+            return None;
+        }
+        let fi = self.dataset.field_index(tt12::FIELD)?;
+        let rustgis_data::Value::Text(code) = self.dataset.features.get(row)?.attrs.get(fi)? else { return None };
+        tt12::group_of(code).map(|g| (g.image, g.outline))
+    }
+
     /// The symbol a row draws with.
     pub fn symbol(&self, row: usize) -> Symbol {
         if self.graphics { graphics::symbol(&self.dataset, row) } else { self.renderer.symbol_for(&self.dataset, row) }
-    }
-
-    /// How far a point row's marker is turned, in degrees clockwise ([`Layer::marker_rotation`]): 0
-    /// without, or where the row's value isn't a number.
-    pub fn marker_turn(&self, row: usize) -> f32 {
-        let Some(r) = self.marker_rotation.as_ref().filter(|_| !self.graphics) else { return 0.0 };
-        r.turn(&self.dataset, row)
     }
 
     /// The stacked strokes a line feature row is drawn with: its class's own
@@ -1752,31 +1755,24 @@ mod tests {
     }
 
     #[test]
-    fn a_marker_rotation_is_kept_and_a_crafted_one_reads_as_none() {
-        let mut l =
-            Layer::new(1, Dataset::new("p", GeometryType::Point, vec![rustgis_data::Field::new("a", rustgis_data::FieldType::Double)]));
-        l.dataset.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![rustgis_data::Value::Float(450.0)]);
-        // None isn't written: an older RustGIS reads the layer as before.
-        assert!(serde_json::to_value(&l).unwrap().get("marker_rotation").is_none());
-        l.marker_rotation = Some(symbology::MarkerRotation { field: "a".into(), counterclockwise: true });
-        let v = serde_json::to_value(&l).unwrap();
-        let back: Layer = serde_json::from_value(v.clone()).unwrap();
-        assert_eq!(back.marker_rotation, l.marker_rotation);
-        assert_eq!(back.marker_turn(0), -90.0, "450° counterclockwise");
-        for junk in [
-            serde_json::json!(5),
-            serde_json::json!({"field": 3}),
-            serde_json::json!({"field": ""}),
-            serde_json::json!({"field": "x".repeat(10_000)}),
-        ] {
-            let mut v = v.clone();
-            v["marker_rotation"] = junk.clone();
-            let read: Layer = serde_json::from_value(v).unwrap();
-            assert!(read.marker_rotation.is_none(), "{junk}");
-        }
-        // A field the data lacks turns nothing.
-        l.marker_rotation = Some(symbology::MarkerRotation { field: "gone".into(), counterclockwise: false });
-        assert_eq!(l.marker_turn(0), 0.0);
+    fn tt12_image_by_code_and_scale() {
+        let mut d = Dataset::new("parcels", GeometryType::Polygon, vec![Field::new("layer", FieldType::Text)]);
+        d.push(None, vec![Value::Text("ODV01".into())]);
+        d.push(None, vec![Value::Text("ZZZ".into())]);
+        let mut l = Layer::new(1, d);
+        assert_eq!(l.tt12_image(0, 5000.0), None, "not a Circular 12 layer");
+        l.tt12 = true;
+        assert_eq!(l.tt12_image(0, 5000.0), Some(("DatDonViO.png", color::Rgba::rgb(0xff, 0x7c, 0x01))));
+        assert_eq!(l.tt12_image(0, 10_000.0).map(|i| i.0), Some("DatDonViO.png"));
+        assert_eq!(l.tt12_image(0, 50_000.0), None);
+        assert_eq!(l.tt12_image(1, 5000.0), None);
+        assert_eq!(l.tt12_image(99, 5000.0), None);
+        let back: Layer = serde_json::from_value(serde_json::to_value(&l).unwrap()).unwrap();
+        assert!(back.tt12);
+        let mut old = serde_json::to_value(Layer::new(2, Dataset::new("p", GeometryType::Polygon, vec![]))).unwrap();
+        assert!(old.get("tt12").is_none(), "left out when off");
+        old.as_object_mut().unwrap().remove("tt12");
+        assert!(!serde_json::from_value::<Layer>(old).unwrap().tt12);
     }
 
     #[test]

@@ -10,6 +10,8 @@
 //! [`tool`] and run by [`run`] like the rest.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod cad;
+pub mod cad_network;
 pub mod convert;
 pub mod dggs;
 pub mod geodesic;

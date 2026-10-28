@@ -2,15 +2,15 @@
 //!
 //! The ENTITIES section is read, with blocks inserted where INSERTs place them (scaled, rotated,
 //! in arrays, nested to a bounded depth): POINT, LINE, LWPOLYLINE and POLYLINE (bulges drawn as
-//! arcs; polyface meshes as polygons), CIRCLE, ARC, ELLIPSE, SPLINE, LEADER, TEXT, MTEXT and
-//! ATTRIB (points with their text), HATCH boundaries, SOLID, TRACE and 3DFACE (polygons), and the
+//! arcs; polyface meshes as polygons), CIRCLE, ARC, ELLIPSE, SPLINE, LEADER, TEXT and MTEXT
+//! (points with their text), block attributes (fields of a point where the block is inserted), HATCH boundaries, SOLID, TRACE and 3DFACE (polygons), and the
 //! blocks of DIMENSIONs. Entities in an object's own coordinate system (an extrusion direction)
 //! are turned into the drawing's. Each feature keeps its layer, entity type, colour (ACI, BYLAYER
 //! and BYBLOCK resolved), linetype, text and elevation.
 //!
 //! A drawing doesn't say its coordinate system: one given converts the coordinates to
-//! longitude/latitude; without one they're kept as they are and the report says so. Binary DXF and
-//! DWG aren't read here.
+//! longitude/latitude; without one they're kept as they are and the report says so. External references (XREF) aren't read; the report names their files.
+//! Binary DXF isn't read here; DWG is, once the ODA File Converter turns it into DXF (`source::oda`).
 //!
 //! The file is hostile: counts are bounded, block nesting is cut off (and cycles refused), and an
 //! entity that can't be read is skipped and counted.
@@ -43,6 +43,10 @@ const MAX_PATH_COPIES: usize = 100_000;
 const MAX_STEPS: usize = if cfg!(target_arch = "wasm32") { 2_000_000 } else { 8_000_000 };
 /// The most pieces (vertices, knots, edges) a count in the file may ask for.
 const MAX_COUNT: usize = 1_000_000;
+/// The most attributes one INSERT keeps.
+const MAX_ATTRIBS: usize = 256;
+/// The most attribute tags that become fields in one drawing (the rest are counted).
+const MAX_TAG_FIELDS: usize = 64;
 /// The most coordinates one drawing's features hold together (a block of a large polyline inserted
 /// in an array multiplies them).
 /// (Each costs about 40 bytes while read: 20M is under a gigabyte. Tests use a smaller budget.)
@@ -56,13 +60,15 @@ const MAX_TOTAL_VERTICES: usize = if cfg!(test) {
 /// Segments of a full circle.
 const CIRCLE: f64 = 72.0;
 
-/// What to read: the coordinate system of a drawing (which never says), one DXF layer only, and
-/// whether the layouts' entities (paper space) are drawn with the model's.
+/// What to read: the coordinate system of a drawing (which never says), one DXF layer only,
+/// whether the layouts' entities (paper space) are drawn with the model's, and how block attributes come.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options<'a> {
     pub crs: Option<Crs>,
     pub layer: Option<&'a str>,
     pub paper_space: bool,
+    /// Each ATTRIB as a point of its own with its text, as before attributes became fields.
+    pub attribs_as_points: bool,
 }
 
 pub fn is_dxf_name(name: &str) -> bool {
@@ -239,7 +245,7 @@ enum Shape {
     Polygon(Vec<P3>),
     /// A hatch's boundary paths: rings, holes found by nesting.
     Rings(Vec<Vec<P3>>),
-    Insert(Insert),
+    Insert(Box<Insert>),
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +263,10 @@ struct Insert {
     /// What a DIMENSION draws when its block isn't in the file: lines, and its text's point.
     fallback: Vec<Shape>,
     fallback_text: Option<String>,
+    /// The attributes that follow it (tag, text), when they become fields.
+    attribs: Vec<(String, String)>,
+    /// A linear DIMENSION's measured points (13, 14) and the length it measures (42).
+    measured: Option<(P3, P3, f64)>,
 }
 
 /// An entity: what it draws, and what each feature it makes keeps.
@@ -649,7 +659,7 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
         "HATCH" => {
             hatch(g).map(|rings| Shape::Rings(rings.into_iter().map(|r| r.into_iter().map(|p| ocs.apply(p)).collect()).collect()))?
         }
-        "INSERT" => Shape::Insert(Insert {
+        "INSERT" => Shape::Insert(Box::new(Insert {
             block: g.s(2)?.trim().to_string(),
             at: g.pt(10).unwrap_or([0.0; 3]),
             scale: [g.f(41).unwrap_or(1.0), g.f(42).unwrap_or(1.0), g.f(43).unwrap_or(1.0)],
@@ -661,11 +671,13 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
             row_space: g.f(45).unwrap_or(0.0),
             fallback: Vec::new(),
             fallback_text: None,
-        }),
+            attribs: Vec::new(),
+            measured: None,
+        })),
         // A dimension draws its (anonymous) block, already placed in the drawing's coordinates.
         "DIMENSION" => {
             let (fallback, fallback_text) = dimension(g);
-            Shape::Insert(Insert {
+            Shape::Insert(Box::new(Insert {
                 block: g.s(2).map(str::trim).unwrap_or("").to_string(),
                 at: [0.0; 3],
                 scale: [1.0; 3],
@@ -677,7 +689,9 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
                 row_space: 0.0,
                 fallback,
                 fallback_text,
-            })
+                attribs: Vec::new(),
+                measured: measured(g),
+            }))
         }
         // A multiline: its centre line (the vertices it runs through).
         "MLINE" => {
@@ -747,6 +761,17 @@ fn dimension(g: &G) -> (Vec<Shape>, Option<String>) {
 fn measure(v: f64) -> String {
     let s = format!("{v:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// A linear dimension's (rotated or aligned) measured points, 13 and 14, and the length it
+/// measures: group 42, else the distance between them.
+fn measured(g: &G) -> Option<(P3, P3, f64)> {
+    if g.i(70).unwrap_or(0) & 7 > 1 {
+        return None;
+    }
+    let (a, b) = (g.pt(13)?, g.pt(14)?);
+    let m = g.f(42).filter(|m| *m > 0.0).unwrap_or_else(|| (b[0] - a[0]).hypot(b[1] - a[1]));
+    Some((a, b, m))
 }
 
 /// A polyface mesh's faces as polygons (its VERTEX records: positions, then faces by index).
@@ -939,6 +964,8 @@ struct Drawing {
     /// Lower-cased name → the name as written, colour, linetype.
     layers: HashMap<String, (String, i64, String)>,
     blocks: HashMap<String, (P3, Vec<Ent>)>,
+    /// External references: lower-cased block name → the file it names (group 1, else the name).
+    xrefs: HashMap<String, String>,
     entities: Vec<Ent>,
     /// Entities not drawn, by kind.
     unread: BTreeMap<String, usize>,
@@ -947,11 +974,19 @@ struct Drawing {
 }
 
 /// Reads the records of each section.
-fn drawing(records: &[Record]) -> Drawing {
-    let mut d = Drawing { layers: HashMap::new(), blocks: HashMap::new(), entities: Vec::new(), unread: BTreeMap::new(), bad: 0 };
+fn drawing(records: &[Record], attribs_as_points: bool) -> Drawing {
+    let mut d = Drawing {
+        layers: HashMap::new(),
+        blocks: HashMap::new(),
+        xrefs: HashMap::new(),
+        entities: Vec::new(),
+        unread: BTreeMap::new(),
+        bad: 0,
+    };
     let mut section = "";
-    // The block being read: name, base point, entities.
-    let mut block: Option<(String, P3, Vec<Ent>)> = None;
+    // The block being read: name, base point, entities, and the file it names when it is an
+    // external reference.
+    let mut block: Option<(String, P3, Vec<Ent>, Option<String>)> = None;
     let mut i = 0usize;
     while let Some(r) = records.get(i) {
         i += 1;
@@ -979,14 +1014,23 @@ fn drawing(records: &[Record]) -> Drawing {
                 if section == "BLOCKS" {
                     if r.kind == "BLOCK" {
                         let name = g.s(2).map(str::trim).unwrap_or("").to_string();
-                        block = Some((name, g.pt(10).unwrap_or([0.0; 3]), Vec::new()));
+                        let xref = (g.i(70).unwrap_or(0) & 4 != 0)
+                            .then(|| g.s(1).map(str::trim).filter(|p| !p.is_empty()).unwrap_or(&name).to_string());
+                        block = Some((name, g.pt(10).unwrap_or([0.0; 3]), Vec::new(), xref));
                         continue;
                     }
                     if r.kind == "ENDBLK" {
-                        if let Some((name, base, ents)) = block.take()
+                        if let Some((name, base, ents, xref)) = block.take()
                             && !name.is_empty()
                         {
-                            d.blocks.insert(name.to_ascii_lowercase(), (base, ents));
+                            match xref {
+                                Some(file) => {
+                                    d.xrefs.insert(name.to_ascii_lowercase(), file);
+                                }
+                                None => {
+                                    d.blocks.insert(name.to_ascii_lowercase(), (base, ents));
+                                }
+                            }
                         }
                         continue;
                     }
@@ -1007,6 +1051,22 @@ fn drawing(records: &[Record]) -> Drawing {
                 // give its value).
                 if matches!(r.kind, "SEQEND" | "VERTEX") || (r.kind == "ATTDEF" && g.i(70).unwrap_or(0) & 2 == 0) {
                     continue;
+                }
+                // A block's attributes follow its INSERT (up to its SEQEND): kept with it, as fields.
+                if r.kind == "ATTRIB" && !attribs_as_points {
+                    let last = match &mut block {
+                        Some((_, _, ents, _)) if section == "BLOCKS" => ents.last_mut(),
+                        _ if section == "ENTITIES" => d.entities.last_mut(),
+                        _ => None,
+                    };
+                    if let Some(Ent { kind: "INSERT", shape: Shape::Insert(ins), .. }) = last
+                        && let Some(tag) = g.s(2).map(str::trim).filter(|t| !t.is_empty())
+                    {
+                        if ins.attribs.len() < MAX_ATTRIBS {
+                            ins.attribs.push((tag.to_string(), plain_text(g.s(1).unwrap_or(""))));
+                        }
+                        continue;
+                    }
                 }
                 let Some(kind) = kind_name(r.kind) else {
                     *d.unread.entry(r.kind.to_string()).or_insert(0) += 1;
@@ -1038,7 +1098,7 @@ fn drawing(records: &[Record]) -> Drawing {
                     shape,
                 };
                 match &mut block {
-                    Some((_, _, ents)) if section == "BLOCKS" => ents.push(e),
+                    Some((_, _, ents, _)) if section == "BLOCKS" => ents.push(e),
                     _ if section == "ENTITIES" => d.entities.push(e),
                     _ => {}
                 }
@@ -1080,6 +1140,12 @@ struct Out {
     vertex_capped: bool,
     /// The copies the arrays above make together on the current nesting path.
     copies: usize,
+    /// External references placed: lower-cased block name → INSERTs.
+    xrefs: BTreeMap<String, usize>,
+    /// Attribute tags made fields of the points layer so far ([`MAX_TAG_FIELDS`]), and values
+    /// left out under tags beyond them.
+    tag_fields: usize,
+    tags_dropped: usize,
 }
 
 fn fields() -> Vec<Field> {
@@ -1148,10 +1214,22 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
             c => c.abs(),
         };
         if let Shape::Insert(ins) = &e.shape {
+            if !ins.attribs.is_empty() && opts.layer.is_none_or(|w| layer.eq_ignore_ascii_case(w)) {
+                attribute_point(e, ins, xf, layer, color, linetype(), e.paper || from.paper, out);
+            }
+            if let Some(m) = ins.measured
+                && opts.layer.is_none_or(|w| layer.eq_ignore_ascii_case(w))
+            {
+                measured_line(e, ins, m, xf, layer, color, linetype(), e.paper || from.paper, from.block, out);
+            }
             // Block names are case-insensitive, in the cycle check too.
             let key = ins.block.to_ascii_lowercase();
             if depth >= MAX_DEPTH || stack.contains(&key) {
                 out.cut += 1;
+                continue;
+            }
+            if d.xrefs.contains_key(&key) {
+                *out.xrefs.entry(key).or_insert(0) += 1;
                 continue;
             }
             let Some((base, inner)) = d.blocks.get(&key) else {
@@ -1293,6 +1371,102 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
     }
 }
 
+/// An INSERT's attributes: a point at its insertion point, a field per tag (a tag named like a
+/// built-in field gets `_attr`).
+#[allow(clippy::too_many_arguments)]
+fn attribute_point(e: &Ent, ins: &Insert, xf: &Xf, layer: &str, color: i64, linetype: Option<&str>, paper: bool, out: &mut Out) {
+    if out.vertices >= MAX_TOTAL_VERTICES {
+        out.vertex_capped = true;
+        return;
+    }
+    let at = xf.apply(Xf::ocs(ins.extrusion).apply(ins.at));
+    if !finite(&[at]) {
+        out.cut += 1;
+        return;
+    }
+    out.vertices += 1;
+    let attrs = vec![
+        Value::Text(layer.to_string()),
+        Value::Text(e.kind.to_string()),
+        Value::Int(color),
+        linetype.map(|l| Value::Text(l.to_string())).unwrap_or_default(),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Text(ins.block.clone()),
+        Value::Float(at[2]),
+        Value::Bool(paper),
+    ];
+    out.points.push_next(Some(Geometry::Point(xy(at))), attrs);
+    out.count += 1;
+    let built_in = fields();
+    for (tag, text) in &ins.attribs {
+        let name = if built_in.iter().any(|f| f.name.eq_ignore_ascii_case(tag)) { format!("{tag}_attr") } else { tag.clone() };
+        let i = match out.points.field_index(&name) {
+            Some(i) => i,
+            None if out.tag_fields >= MAX_TAG_FIELDS => {
+                out.tags_dropped += 1;
+                continue;
+            }
+            None => {
+                out.tag_fields += 1;
+                out.points.ensure_field(&name, FieldType::Text)
+            }
+        };
+        if let Some(v) = out.points.features.last_mut().and_then(|f| f.attrs.get_mut(i)) {
+            *v = Value::Text(text.clone());
+        }
+    }
+}
+
+/// A linear dimension's measured points as a line of the lines layer, with the length it
+/// measures in a `measure` field: where a length is written on the drawing.
+fn measured_line(
+    e: &Ent,
+    ins: &Insert,
+    (a, b, m): (P3, P3, f64),
+    xf: &Xf,
+    layer: &str,
+    color: i64,
+    linetype: Option<&str>,
+    paper: bool,
+    block: Option<&str>,
+    out: &mut Out,
+) {
+    if out.count >= MAX_FEATURES {
+        out.capped = true;
+        return;
+    }
+    if out.vertices.saturating_add(2) > MAX_TOTAL_VERTICES {
+        out.vertex_capped = true;
+        return;
+    }
+    let (a, b) = (xf.apply(a), xf.apply(b));
+    if !finite(&[a, b]) || !m.is_finite() {
+        out.cut += 1;
+        return;
+    }
+    out.vertices += 2;
+    let attrs = vec![
+        Value::Text(layer.to_string()),
+        Value::Text(e.kind.to_string()),
+        Value::Int(color),
+        linetype.map(|l| Value::Text(l.to_string())).unwrap_or_default(),
+        ins.fallback_text.clone().map(Value::Text).unwrap_or_default(),
+        Value::Null,
+        Value::Null,
+        block.map(|b| Value::Text(b.to_string())).unwrap_or_default(),
+        Value::Float(a[2]),
+        Value::Bool(paper),
+    ];
+    let mi = out.lines.ensure_field("measure", FieldType::Double);
+    out.lines.push_next(Some(Geometry::Line(vec![vec![xy(a), xy(b)]])), attrs);
+    if let Some(v) = out.lines.features.last_mut().and_then(|f| f.attrs.get_mut(mi)) {
+        *v = Value::Float(m);
+    }
+    out.count += 1;
+}
+
 /// Reads a DXF drawing into its points, lines and polygons layers (those with features).
 pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Dataset, ReadReport)>> {
     let name = std::path::Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("dxf").to_string();
@@ -1307,7 +1481,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             None => format!("{file_name}: not a DXF drawing"),
         }));
     }
-    let d = drawing(&recs);
+    let d = drawing(&recs, opts.attribs_as_points);
     let mut out = Out {
         points: Dataset::new(format!("{name} points"), GeometryType::Point, fields()),
         lines: Dataset::new(format!("{name} lines"), GeometryType::Polyline, fields()),
@@ -1322,6 +1496,9 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         vertices: 0,
         vertex_capped: false,
         copies: 1,
+        xrefs: BTreeMap::new(),
+        tag_fields: 0,
+        tags_dropped: 0,
     };
     let none = Inherit { layer: None, layer_key: None, color: None, linetype: None, block: None, paper: false };
     emit(&d, &d.entities, &Xf::ID, none, 0, &mut Vec::new(), opts, &mut out);
@@ -1356,6 +1533,20 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         report
             .messages
             .push(format!("the drawing's blocks place more than {MAX_STEPS} entities (arrays of nested blocks): the rest are left out"));
+    }
+    if !out.xrefs.is_empty() {
+        let files: Vec<&str> = out.xrefs.keys().filter_map(|k| d.xrefs.get(k)).map(|f| f.rsplit(['\\', '/']).next().unwrap_or(f)).collect();
+        report.messages.push(format!(
+            "external drawings not read ({}): {}; bind them in CAD (XREF › Bind) to include them",
+            files.len(),
+            files.join(", ")
+        ));
+    }
+    if out.tags_dropped > 0 {
+        report.messages.push(format!(
+            "{} values of block attributes were left out: at most {MAX_TAG_FIELDS} attribute tags become fields",
+            out.tags_dropped
+        ));
     }
     if !d.unread.is_empty() {
         let kinds: Vec<String> = d.unread.iter().map(|(k, n)| format!("{n} {k}")).collect();
@@ -1421,7 +1612,7 @@ pub fn layers(file_name: &str, bytes: &[u8]) -> Result<Vec<String>> {
     }
     // The table's layers and those entities (paper space and blocks' too) are on, without
     // drawing anything. Layer 0 in a block takes its INSERT's, so it isn't one of its own there.
-    let d = drawing(&recs);
+    let d = drawing(&recs, true);
     let mut names: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut add = |name: &str, key: &str| {
@@ -1677,14 +1868,17 @@ mod tests {
     fn layers_filter_and_crs() {
         // The table's layers and the entities' (layer 0: an INSERT without a layer group).
         assert_eq!(layers("a.dxf", &sample()).unwrap(), ["0", "Fill", "Labels", "Roads", "Trees"]);
-        let only = read("a.dxf", &sample(), &Options { crs: None, layer: Some("roads"), paper_space: false }).unwrap();
+        let only =
+            read("a.dxf", &sample(), &Options { crs: None, layer: Some("roads"), paper_space: false, attribs_as_points: false }).unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].0.features.len(), 2);
-        assert!(read("a.dxf", &sample(), &Options { crs: None, layer: Some("nope"), paper_space: false }).is_err());
+        assert!(
+            read("a.dxf", &sample(), &Options { crs: None, layer: Some("nope"), paper_space: false, attribs_as_points: false }).is_err()
+        );
         // Converted from a projected system: UTM 33N near its central meridian.
         let crs = Crs::parse("EPSG:32633").unwrap();
         let utm = dxf(&[(0, "SECTION"), (2, "ENTITIES"), (0, "POINT"), (10, "500000"), (20, "4649776"), (0, "ENDSEC"), (0, "EOF")]);
-        let l = read("u.dxf", &utm, &Options { crs: Some(crs), layer: None, paper_space: false }).unwrap();
+        let l = read("u.dxf", &utm, &Options { crs: Some(crs), layer: None, paper_space: false, attribs_as_points: false }).unwrap();
         assert!(l[0].1.messages.is_empty(), "{:?}", l[0].1.messages);
         if let Some(Geometry::Point(c)) = &l[0].0.features[0].geometry {
             assert!((c.x - 15.0).abs() < 1e-6 && (c.y - 42.0).abs() < 0.01, "{c:?}");
@@ -1869,7 +2063,7 @@ mod tests {
         p.extend([(0, "ENDSEC".into()), (0, "EOF".into())]);
         let text: String = p.iter().map(|(c, v)| format!("{c:>3}\n{v}\n")).collect();
         let t = std::time::Instant::now();
-        let r = read("arrays.dxf", text.as_bytes(), &Options { crs: None, layer: Some("y"), paper_space: false });
+        let r = read("arrays.dxf", text.as_bytes(), &Options { crs: None, layer: Some("y"), paper_space: false, attribs_as_points: false });
         assert!(t.elapsed() < std::time::Duration::from_secs(60), "{:?}", t.elapsed());
         assert!(r.is_err(), "nothing on layer y");
         // Drawn: a cap stops the walk and says so, and the arrays cut short are said.
@@ -2154,5 +2348,159 @@ mod tests {
             (0, "EOF"),
         ]);
         assert!(read("x.dxf", &lie, &Options::default()).is_err());
+    }
+
+    /// An external reference (BLOCK flag 4, its file in group 1) isn't read: the report names the
+    /// file, once however many INSERTs place it, and doesn't count it as a broken block.
+    #[test]
+    fn external_references_are_reported() {
+        let d = dxf(&[
+            (0, "SECTION"),
+            (2, "BLOCKS"),
+            (0, "BLOCK"),
+            (2, "Xr.nen"),
+            (70, "4"),
+            (1, ".\\Xr.nen.HIENTRANG.dwg"),
+            (10, "0"),
+            (20, "0"),
+            (0, "ENDBLK"),
+            (0, "ENDSEC"),
+            (0, "SECTION"),
+            (2, "ENTITIES"),
+            (0, "INSERT"),
+            (2, "Xr.nen"),
+            (10, "0"),
+            (20, "0"),
+            (0, "INSERT"),
+            (2, "XR.NEN"),
+            (10, "5"),
+            (20, "5"),
+            (0, "POINT"),
+            (10, "1"),
+            (20, "1"),
+            (0, "ENDSEC"),
+            (0, "EOF"),
+        ]);
+        let l = read("x.dxf", &d, &Options::default()).unwrap();
+        let msgs = &l[0].1.messages;
+        assert!(msgs.iter().any(|m| m.contains("external drawings not read (1)") && m.contains("Xr.nen.HIENTRANG.dwg")), "{msgs:?}");
+        assert_eq!(l[0].1.skipped, 0, "an external reference isn't a broken block");
+    }
+
+    /// A manhole block's attributes: one point at the insertion point with a field per tag, not a
+    /// point per attribute. A tag named like a built-in field gets `_attr`.
+    #[test]
+    fn block_attributes_become_fields() {
+        let d = dxf(&[
+            (0, "SECTION"),
+            (2, "BLOCKS"),
+            (0, "BLOCK"),
+            (2, "HG"),
+            (10, "0"),
+            (20, "0"),
+            (0, "POINT"),
+            (8, "0"),
+            (10, "0"),
+            (20, "0"),
+            (0, "ENDBLK"),
+            (0, "ENDSEC"),
+            (0, "SECTION"),
+            (2, "ENTITIES"),
+            (0, "INSERT"),
+            (8, "T-HO GA"),
+            (66, "1"),
+            (2, "HG"),
+            (10, "100"),
+            (20, "200"),
+            (0, "ATTRIB"),
+            (8, "0"),
+            (10, "100"),
+            (20, "200"),
+            (2, "TEN"),
+            (1, "A1"),
+            (0, "ATTRIB"),
+            (8, "0"),
+            (10, "100"),
+            (20, "201"),
+            (2, "TK"),
+            (1, "3,43"),
+            (0, "ATTRIB"),
+            (8, "0"),
+            (10, "100"),
+            (20, "202"),
+            (2, "layer"),
+            (1, "x"),
+            (0, "SEQEND"),
+            (0, "ENDSEC"),
+            (0, "EOF"),
+        ]);
+        let l = read("a.dxf", &d, &Options::default()).unwrap();
+        let pts = &l[0].0;
+        assert_eq!(pts.features.len(), 2, "the block's point and the insert's point; no ATTRIB points");
+        let col = |name: &str| pts.field_index(name).unwrap();
+        let row = (0..pts.features.len()).find(|&r| pts.value(r, col("entity")) == &Value::Text("INSERT".into())).unwrap();
+        assert_eq!(pts.value(row, col("TEN")), &Value::Text("A1".into()));
+        assert_eq!(pts.value(row, col("TK")), &Value::Text("3,43".into()));
+        assert_eq!(pts.value(row, col("layer_attr")), &Value::Text("x".into()));
+        assert_eq!(pts.value(row, col("layer")), &Value::Text("T-HO GA".into()));
+        assert_eq!(pts.value(row, col("block")), &Value::Text("HG".into()));
+        assert_eq!(pts.features[row].geometry, Some(Geometry::Point(Coord::new(100.0, 200.0))));
+
+        let old = read("a.dxf", &d, &Options { attribs_as_points: true, ..Options::default() }).unwrap();
+        assert_eq!(old[0].0.features.len(), 4, "the block's point and three ATTRIB points");
+        assert!(old[0].0.field_index("TEN").is_none());
+    }
+
+    /// At most `MAX_TAG_FIELDS` tags become fields; the values under the others are counted.
+    #[test]
+    fn attribute_tags_are_bounded() {
+        let mut p: Vec<(i32, String)> = vec![
+            (0, "SECTION".into()),
+            (2, "ENTITIES".into()),
+            (0, "INSERT".into()),
+            (66, "1".into()),
+            (2, "NONE".into()),
+            (10, "0".into()),
+            (20, "0".into()),
+        ];
+        for i in 0..100 {
+            p.extend([(0, "ATTRIB".into()), (10, "0".into()), (20, "0".into()), (2, format!("T{i}")), (1, "v".into())]);
+        }
+        p.extend([(0, "SEQEND".into()), (0, "ENDSEC".into()), (0, "EOF".into())]);
+        let text: String = p.iter().map(|(c, v)| format!("{c:>3}\n{v}\n")).collect();
+        let l = read("t.dxf", text.as_bytes(), &Options::default()).unwrap();
+        assert_eq!(l[0].0.fields.len(), fields().len() + MAX_TAG_FIELDS);
+        assert!(l[0].1.messages.iter().any(|m| m.contains("36 values of block attributes")), "{:?}", l[0].1.messages);
+    }
+
+    #[test]
+    fn dimensions_keep_their_measured_points() {
+        // An aligned dimension (70 = 33: 1 aligned + 32 block-referenced) whose block is missing.
+        let text = dxf(&[
+            (0, "SECTION"),
+            (2, "ENTITIES"),
+            (0, "DIMENSION"),
+            (8, "K-G-DIMS"),
+            (2, "*D1"),
+            (10, "0"),
+            (20, "5"),
+            (13, "0"),
+            (23, "0.1"),
+            (14, "130.29"),
+            (24, "0.1"),
+            (42, "130.29"),
+            (70, "33"),
+            (0, "ENDSEC"),
+            (0, "EOF"),
+        ]);
+        let layers = read("d.dxf", &text, &Options::default()).unwrap();
+        let lines = &layers.iter().find(|(d, _)| d.geometry_type == GeometryType::Polyline).unwrap().0;
+        let mi = lines.field_index("measure").unwrap();
+        let measured: Vec<_> = lines.features.iter().filter(|f| !f.attrs[mi].is_null()).collect();
+        assert_eq!(measured.len(), 1, "one measured line; the dimension's own lines have no measure");
+        assert_eq!(measured[0].attrs[mi], Value::Float(130.29));
+        assert_eq!(measured[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.1), Coord::new(130.29, 0.1)]])));
+        assert_eq!(measured[0].attrs[lines.field_index("entity").unwrap()], Value::Text("DIMENSION".into()));
+        assert_eq!(measured[0].attrs[lines.field_index("layer").unwrap()], Value::Text("K-G-DIMS".into()));
     }
 }

@@ -4065,3 +4065,14 @@ fn list_layers_includes_web_tile_layers() {
     let ctx = tools::context(&s);
     assert!(ctx.contains("characters in all)\" (index ") && ctx.contains("raster, overlay, hidden)"), "{ctx}");
 }
+
+#[test]
+fn html_error_pages_are_named_by_title_not_dumped() {
+    let page = b"<!doctype html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\"> <![endif]-->\n<html><head><title>Attention Required! | Cloudflare</title></head></html>";
+    let resp = HttpResponse { status: 403, body: page.to_vec(), headers: vec![] };
+    let e = crate::Error::response(&Value::Null, &resp).to_string();
+    assert!(e.contains("Attention Required! | Cloudflare") && !e.contains("<!--"), "{e}");
+    let bare = body_text(b"<html><body>x</body></html>", 300);
+    assert!(bare.starts_with("a web page") && !bare.contains('<'), "{bare}");
+    assert_eq!(body_text(b"plain failure", 300), "plain failure");
+}
