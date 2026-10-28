@@ -43,6 +43,10 @@ const MAX_PATH_COPIES: usize = 100_000;
 const MAX_STEPS: usize = if cfg!(target_arch = "wasm32") { 2_000_000 } else { 8_000_000 };
 /// The most pieces (vertices, knots, edges) a count in the file may ask for.
 const MAX_COUNT: usize = 1_000_000;
+/// The most attributes one INSERT keeps.
+const MAX_ATTRIBS: usize = 256;
+/// The most attribute tags that become fields in one drawing (the rest are counted).
+const MAX_TAG_FIELDS: usize = 64;
 /// The most coordinates one drawing's features hold together (a block of a large polyline inserted
 /// in an array multiplies them).
 /// (Each costs about 40 bytes while read: 20M is under a gigabyte. Tests use a smaller budget.)
@@ -56,13 +60,15 @@ const MAX_TOTAL_VERTICES: usize = if cfg!(test) {
 /// Segments of a full circle.
 const CIRCLE: f64 = 72.0;
 
-/// What to read: the coordinate system of a drawing (which never says), one DXF layer only, and
-/// whether the layouts' entities (paper space) are drawn with the model's.
+/// What to read: the coordinate system of a drawing (which never says), one DXF layer only,
+/// whether the layouts' entities (paper space) are drawn with the model's, and how block attributes come.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options<'a> {
     pub crs: Option<Crs>,
     pub layer: Option<&'a str>,
     pub paper_space: bool,
+    /// Each ATTRIB as a point of its own with its text, as before attributes became fields.
+    pub attribs_as_points: bool,
 }
 
 pub fn is_dxf_name(name: &str) -> bool {
@@ -939,6 +945,8 @@ struct Drawing {
     /// Lower-cased name → the name as written, colour, linetype.
     layers: HashMap<String, (String, i64, String)>,
     blocks: HashMap<String, (P3, Vec<Ent>)>,
+    /// External references: lower-cased block name → the file it names (group 1, else the name).
+    xrefs: HashMap<String, String>,
     entities: Vec<Ent>,
     /// Entities not drawn, by kind.
     unread: BTreeMap<String, usize>,
@@ -948,10 +956,11 @@ struct Drawing {
 
 /// Reads the records of each section.
 fn drawing(records: &[Record]) -> Drawing {
-    let mut d = Drawing { layers: HashMap::new(), blocks: HashMap::new(), entities: Vec::new(), unread: BTreeMap::new(), bad: 0 };
+    let mut d = Drawing { layers: HashMap::new(), blocks: HashMap::new(), xrefs: HashMap::new(), entities: Vec::new(), unread: BTreeMap::new(), bad: 0 };
     let mut section = "";
-    // The block being read: name, base point, entities.
-    let mut block: Option<(String, P3, Vec<Ent>)> = None;
+    // The block being read: name, base point, entities, and the file it names when it is an
+    // external reference.
+    let mut block: Option<(String, P3, Vec<Ent>, Option<String>)> = None;
     let mut i = 0usize;
     while let Some(r) = records.get(i) {
         i += 1;
@@ -979,14 +988,23 @@ fn drawing(records: &[Record]) -> Drawing {
                 if section == "BLOCKS" {
                     if r.kind == "BLOCK" {
                         let name = g.s(2).map(str::trim).unwrap_or("").to_string();
-                        block = Some((name, g.pt(10).unwrap_or([0.0; 3]), Vec::new()));
+                        let xref = (g.i(70).unwrap_or(0) & 4 != 0)
+                            .then(|| g.s(1).map(str::trim).filter(|p| !p.is_empty()).unwrap_or(&name).to_string());
+                        block = Some((name, g.pt(10).unwrap_or([0.0; 3]), Vec::new(), xref));
                         continue;
                     }
                     if r.kind == "ENDBLK" {
-                        if let Some((name, base, ents)) = block.take()
+                        if let Some((name, base, ents, xref)) = block.take()
                             && !name.is_empty()
                         {
-                            d.blocks.insert(name.to_ascii_lowercase(), (base, ents));
+                            match xref {
+                                Some(file) => {
+                                    d.xrefs.insert(name.to_ascii_lowercase(), file);
+                                }
+                                None => {
+                                    d.blocks.insert(name.to_ascii_lowercase(), (base, ents));
+                                }
+                            }
                         }
                         continue;
                     }
@@ -1038,7 +1056,7 @@ fn drawing(records: &[Record]) -> Drawing {
                     shape,
                 };
                 match &mut block {
-                    Some((_, _, ents)) if section == "BLOCKS" => ents.push(e),
+                    Some((_, _, ents, _)) if section == "BLOCKS" => ents.push(e),
                     _ if section == "ENTITIES" => d.entities.push(e),
                     _ => {}
                 }
@@ -1080,6 +1098,8 @@ struct Out {
     vertex_capped: bool,
     /// The copies the arrays above make together on the current nesting path.
     copies: usize,
+    /// External references placed: lower-cased block name → INSERTs.
+    xrefs: BTreeMap<String, usize>,
 }
 
 fn fields() -> Vec<Field> {
@@ -1152,6 +1172,10 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
             let key = ins.block.to_ascii_lowercase();
             if depth >= MAX_DEPTH || stack.contains(&key) {
                 out.cut += 1;
+                continue;
+            }
+            if d.xrefs.contains_key(&key) {
+                *out.xrefs.entry(key).or_insert(0) += 1;
                 continue;
             }
             let Some((base, inner)) = d.blocks.get(&key) else {
@@ -1322,6 +1346,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         vertices: 0,
         vertex_capped: false,
         copies: 1,
+        xrefs: BTreeMap::new(),
     };
     let none = Inherit { layer: None, layer_key: None, color: None, linetype: None, block: None, paper: false };
     emit(&d, &d.entities, &Xf::ID, none, 0, &mut Vec::new(), opts, &mut out);
@@ -1356,6 +1381,19 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         report
             .messages
             .push(format!("the drawing's blocks place more than {MAX_STEPS} entities (arrays of nested blocks): the rest are left out"));
+    }
+    if !out.xrefs.is_empty() {
+        let files: Vec<&str> = out
+            .xrefs
+            .keys()
+            .filter_map(|k| d.xrefs.get(k))
+            .map(|f| f.rsplit(['\\', '/']).next().unwrap_or(f))
+            .collect();
+        report.messages.push(format!(
+            "external drawings not read ({}): {}; bind them in CAD (XREF › Bind) to include them",
+            files.len(),
+            files.join(", ")
+        ));
     }
     if !d.unread.is_empty() {
         let kinds: Vec<String> = d.unread.iter().map(|(k, n)| format!("{n} {k}")).collect();
@@ -2154,5 +2192,42 @@ mod tests {
             (0, "EOF"),
         ]);
         assert!(read("x.dxf", &lie, &Options::default()).is_err());
+    }
+
+    /// An external reference (BLOCK flag 4, its file in group 1) isn't read: the report names the
+    /// file, once however many INSERTs place it, and doesn't count it as a broken block.
+    #[test]
+    fn external_references_are_reported() {
+        let d = dxf(&[
+            (0, "SECTION"),
+            (2, "BLOCKS"),
+            (0, "BLOCK"),
+            (2, "Xr.nen"),
+            (70, "4"),
+            (1, ".\\Xr.nen.HIENTRANG.dwg"),
+            (10, "0"),
+            (20, "0"),
+            (0, "ENDBLK"),
+            (0, "ENDSEC"),
+            (0, "SECTION"),
+            (2, "ENTITIES"),
+            (0, "INSERT"),
+            (2, "Xr.nen"),
+            (10, "0"),
+            (20, "0"),
+            (0, "INSERT"),
+            (2, "XR.NEN"),
+            (10, "5"),
+            (20, "5"),
+            (0, "POINT"),
+            (10, "1"),
+            (20, "1"),
+            (0, "ENDSEC"),
+            (0, "EOF"),
+        ]);
+        let l = read("x.dxf", &d, &Options::default()).unwrap();
+        let msgs = &l[0].1.messages;
+        assert!(msgs.iter().any(|m| m.contains("external drawings not read (1)") && m.contains("Xr.nen.HIENTRANG.dwg")), "{msgs:?}");
+        assert_eq!(l[0].1.skipped, 0, "an external reference isn't a broken block");
     }
 }
