@@ -265,6 +265,8 @@ struct Insert {
     fallback_text: Option<String>,
     /// The attributes that follow it (tag, text), when they become fields.
     attribs: Vec<(String, String)>,
+    /// A linear DIMENSION's measured points (13, 14) and the length it measures (42).
+    measured: Option<(P3, P3, f64)>,
 }
 
 /// An entity: what it draws, and what each feature it makes keeps.
@@ -670,6 +672,7 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
             fallback: Vec::new(),
             fallback_text: None,
             attribs: Vec::new(),
+            measured: None,
         }),
         // A dimension draws its (anonymous) block, already placed in the drawing's coordinates.
         "DIMENSION" => {
@@ -687,6 +690,7 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
                 fallback,
                 fallback_text,
                 attribs: Vec::new(),
+                measured: measured(g),
             })
         }
         // A multiline: its centre line (the vertices it runs through).
@@ -757,6 +761,17 @@ fn dimension(g: &G) -> (Vec<Shape>, Option<String>) {
 fn measure(v: f64) -> String {
     let s = format!("{v:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// A linear dimension's (rotated or aligned) measured points, 13 and 14, and the length it
+/// measures: group 42, else the distance between them.
+fn measured(g: &G) -> Option<(P3, P3, f64)> {
+    if g.i(70).unwrap_or(0) & 7 > 1 {
+        return None;
+    }
+    let (a, b) = (g.pt(13)?, g.pt(14)?);
+    let m = g.f(42).filter(|m| *m > 0.0).unwrap_or_else(|| (b[0] - a[0]).hypot(b[1] - a[1]));
+    Some((a, b, m))
 }
 
 /// A polyface mesh's faces as polygons (its VERTEX records: positions, then faces by index).
@@ -1202,6 +1217,11 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
             if !ins.attribs.is_empty() && opts.layer.is_none_or(|w| layer.eq_ignore_ascii_case(w)) {
                 attribute_point(e, ins, xf, layer, color, linetype(), e.paper || from.paper, out);
             }
+            if let Some(m) = ins.measured
+                && opts.layer.is_none_or(|w| layer.eq_ignore_ascii_case(w))
+            {
+                measured_line(e, ins, m, xf, layer, color, linetype(), e.paper || from.paper, from.block, out);
+            }
             // Block names are case-insensitive, in the cycle check too.
             let key = ins.block.to_ascii_lowercase();
             if depth >= MAX_DEPTH || stack.contains(&key) {
@@ -1397,6 +1417,43 @@ fn attribute_point(e: &Ent, ins: &Insert, xf: &Xf, layer: &str, color: i64, line
             *v = Value::Text(text.clone());
         }
     }
+}
+
+/// A linear dimension's measured points as a line of the lines layer, with the length it
+/// measures in a `measure` field: where a length is written on the drawing.
+fn measured_line(e: &Ent, ins: &Insert, (a, b, m): (P3, P3, f64), xf: &Xf, layer: &str, color: i64, linetype: Option<&str>, paper: bool, block: Option<&str>, out: &mut Out) {
+    if out.count >= MAX_FEATURES {
+        out.capped = true;
+        return;
+    }
+    if out.vertices.saturating_add(2) > MAX_TOTAL_VERTICES {
+        out.vertex_capped = true;
+        return;
+    }
+    let (a, b) = (xf.apply(a), xf.apply(b));
+    if !finite(&[a, b]) || !m.is_finite() {
+        out.cut += 1;
+        return;
+    }
+    out.vertices += 2;
+    let attrs = vec![
+        Value::Text(layer.to_string()),
+        Value::Text(e.kind.to_string()),
+        Value::Int(color),
+        linetype.map(|l| Value::Text(l.to_string())).unwrap_or_default(),
+        ins.fallback_text.clone().map(Value::Text).unwrap_or_default(),
+        Value::Null,
+        Value::Null,
+        block.map(|b| Value::Text(b.to_string())).unwrap_or_default(),
+        Value::Float(a[2]),
+        Value::Bool(paper),
+    ];
+    let mi = out.lines.ensure_field("measure", FieldType::Double);
+    out.lines.push_next(Some(Geometry::Line(vec![vec![xy(a), xy(b)]])), attrs);
+    if let Some(v) = out.lines.features.last_mut().and_then(|f| f.attrs.get_mut(mi)) {
+        *v = Value::Float(m);
+    }
+    out.count += 1;
 }
 
 /// Reads a DXF drawing into its points, lines and polygons layers (those with features).
@@ -2403,5 +2460,36 @@ mod tests {
         let l = read("t.dxf", text.as_bytes(), &Options::default()).unwrap();
         assert_eq!(l[0].0.fields.len(), fields().len() + MAX_TAG_FIELDS);
         assert!(l[0].1.messages.iter().any(|m| m.contains("36 values of block attributes")), "{:?}", l[0].1.messages);
+    }
+
+    #[test]
+    fn dimensions_keep_their_measured_points() {
+        // An aligned dimension (70 = 33: 1 aligned + 32 block-referenced) whose block is missing.
+        let text = dxf(&[
+            (0, "SECTION"),
+            (2, "ENTITIES"),
+            (0, "DIMENSION"),
+            (8, "K-G-DIMS"),
+            (2, "*D1"),
+            (10, "0"),
+            (20, "5"),
+            (13, "0"),
+            (23, "0.1"),
+            (14, "130.29"),
+            (24, "0.1"),
+            (42, "130.29"),
+            (70, "33"),
+            (0, "ENDSEC"),
+            (0, "EOF"),
+        ]);
+        let layers = read("d.dxf", &text, &Options::default()).unwrap();
+        let lines = &layers.iter().find(|(d, _)| d.geometry_type == GeometryType::Polyline).unwrap().0;
+        let mi = lines.field_index("measure").unwrap();
+        let measured: Vec<_> = lines.features.iter().filter(|f| !f.attrs[mi].is_null()).collect();
+        assert_eq!(measured.len(), 1, "one measured line; the dimension's own lines have no measure");
+        assert_eq!(measured[0].attrs[mi], Value::Float(130.29));
+        assert_eq!(measured[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.1), Coord::new(130.29, 0.1)]])));
+        assert_eq!(measured[0].attrs[lines.field_index("entity").unwrap()], Value::Text("DIMENSION".into()));
+        assert_eq!(measured[0].attrs[lines.field_index("layer").unwrap()], Value::Text("K-G-DIMS".into()));
     }
 }
