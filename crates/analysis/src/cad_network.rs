@@ -431,6 +431,11 @@ pub fn network(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let anchors = nodes.iter().enumerate().map(|(k, n)| (n.at, k)).collect();
     let book = Book { found: Vec::new(), prior, tol: snap.max(0.05), dropped: 0 };
     let mut net = Net { runs, nodes, dims, snap, ask, book, work: 0, overshoots: Vec::new(), anchors, on: Vec::new() };
+    net.duplicates();
+    net.ends();
+    net.mid_crossings();
+    net.node_cuts();
+    net.dimension_cuts();
     let network = net.network_layer(lines, nodes_ds, &node_fields, tolerance, &plane);
     let proposals = net.proposals_layer(lines, &plane);
     let messages = net.summary(network.features.len(), capped);
@@ -438,6 +443,225 @@ pub fn network(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 }
 
 impl Net {
+    /// Lines drawn twice: on one CAD layer one is dropped; across CAD layers dropping is
+    /// proposed.
+    fn duplicates(&mut self) {
+        for i in 0..self.runs.len() {
+            for j in i + 1..self.runs.len() {
+                self.work += 1;
+                if self.work > MAX_WORK {
+                    return;
+                }
+                let (Some(a), Some(b)) = (self.runs.get(i), self.runs.get(j)) else { continue };
+                if a.gone || b.gone || !same_line(&a.pts, &b.pts) {
+                    continue;
+                }
+                let level = if a.layer.eq_ignore_ascii_case(&b.layer) { Level::Fixed } else { Level::Ask };
+                let (at, row, note) = (point_at(&b.pts, length(&b.pts) / 2.0), b.row, format!("drawn twice (also on {})", a.layer));
+                if self.book.note("duplicate", at, None, Some(row), note, level)
+                    && let Some(b) = self.runs.get_mut(j)
+                {
+                    b.gone = true;
+                }
+            }
+        }
+    }
+
+    /// Every end: joined to a node or line it stops short of, trimmed where it runs past a
+    /// line; an end with nothing near is reported.
+    fn ends(&mut self) {
+        for i in 0..self.runs.len() {
+            for start in [true, false] {
+                if self.work > MAX_WORK {
+                    return;
+                }
+                self.end(i, start);
+            }
+        }
+    }
+
+    fn end(&mut self, i: usize, start: bool) {
+        let Some(run) = self.runs.get(i).filter(|r| !r.gone) else { return };
+        let Some(end) = (if start { run.pts.first() } else { run.pts.last() }).copied() else { return };
+        let (row, len) = (run.row, length(&run.pts));
+        let node = self.nodes.iter().map(|n| (dist(n.at, end), n.at)).min_by(|a, b| a.0.total_cmp(&b.0));
+        if node.is_some_and(|(d, _)| d < SAME) {
+            return;
+        }
+        // The nearest line it stops short of; the nearest it runs past (how far past, where
+        // along this line, where).
+        let mut short: Option<(f64, Coord)> = None;
+        let mut past: Option<(f64, f64, Coord)> = None;
+        for (j, other) in self.runs.iter().enumerate() {
+            if j == i || other.gone {
+                continue;
+            }
+            self.work += other.pts.len();
+            if let Some((d, _, q)) = foot(&other.pts, end)
+                && short.is_none_or(|(sd, _)| d < sd)
+            {
+                short = Some((d, q));
+            }
+            for (s, _, x) in crossings(&run.pts, &other.pts, &mut self.work) {
+                let tail = if start { s } else { len - s };
+                if tail > SAME && tail <= self.ask && past.is_none_or(|(t, ..)| tail < t) {
+                    past = Some((tail, s, x));
+                }
+            }
+        }
+        let (snap, ask) = (self.snap, self.ask);
+        let (kind, to, note, level, trim) = match (node.filter(|(d, _)| *d < snap), past) {
+            (Some((d, at)), _) => ("gap", at, format!("stops {d:.2} m from a node"), Level::Fixed, None),
+            (None, Some((tail, s, x))) => {
+                self.overshoots.push(x);
+                let level = if tail < snap { Level::Fixed } else { Level::Ask };
+                ("overshoot", x, format!("runs {tail:.2} m past a line"), level, Some(s))
+            }
+            (None, None) => match [node, short].into_iter().flatten().filter(|(d, _)| *d <= ask).min_by(|a, b| a.0.total_cmp(&b.0)) {
+                Some((d, _)) if d < SAME => return,
+                Some((d, q)) => {
+                    let level = if d < snap { Level::Fixed } else { Level::Ask };
+                    ("gap", q, format!("stops {d:.2} m short of a line or node"), level, None)
+                }
+                None => {
+                    self.book.note("dangling_end", end, None, Some(row), format!("an end with nothing within {ask} m"), Level::Report);
+                    return;
+                }
+            },
+        };
+        if !self.book.note(kind, end, Some(to), Some(row), note, level) {
+            return;
+        }
+        let Some(run) = self.runs.get_mut(i) else { return };
+        match trim {
+            Some(s) => {
+                let mut pieces = split(&run.pts, &[s]);
+                let kept = if start { pieces.pop() } else { pieces.into_iter().next() };
+                if let Some((_, pts)) = kept {
+                    run.pts = pts;
+                }
+            }
+            None => {
+                if let Some(p) = if start { run.pts.first_mut() } else { run.pts.last_mut() } {
+                    *p = to;
+                }
+            }
+        }
+    }
+
+    /// Lines crossing mid-line with no node: proposed to be cut there (they may be pipes at
+    /// different depths).
+    fn mid_crossings(&mut self) {
+        for i in 0..self.runs.len() {
+            for j in i + 1..self.runs.len() {
+                if self.work > MAX_WORK {
+                    return;
+                }
+                let (Some(a), Some(b)) = (self.runs.get(i), self.runs.get(j)) else { continue };
+                if a.gone || b.gone {
+                    continue;
+                }
+                let (la, lb, row) = (length(&a.pts), length(&b.pts), a.row);
+                let found = crossings(&a.pts, &b.pts, &mut self.work);
+                let snap = self.snap;
+                for (sa, sb, x) in found {
+                    let near = |p: Coord| dist(p, x) <= snap;
+                    let at_end = sa < SAME || la - sa < SAME || sb < SAME || lb - sb < SAME;
+                    if at_end || self.overshoots.iter().any(|p| near(*p)) || self.nodes.iter().any(|n| near(n.at)) {
+                        continue;
+                    }
+                    if self.book.note("crossing", x, None, Some(row), "crosses another line with no node: pipes at different depths?".into(), Level::Ask) {
+                        if let Some(a) = self.runs.get_mut(i) {
+                            a.cuts.push(sa);
+                        }
+                        if let Some(b) = self.runs.get_mut(j) {
+                            b.cuts.push(sb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Nodes on lines: a line is cut at a node on it; a cut at the foot of a node a little off
+    /// a line is proposed; a node far from every line is reported.
+    fn node_cuts(&mut self) {
+        let vertices: usize = self.runs.iter().map(|r| r.pts.len()).sum();
+        for (k, n) in self.nodes.iter().enumerate() {
+            self.work += vertices;
+            if self.work > MAX_WORK {
+                return;
+            }
+            let best = self
+                .runs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.gone)
+                .filter_map(|(i, r)| foot(&r.pts, n.at).map(|f| (i, f)))
+                .min_by(|a, b| a.1.0.total_cmp(&b.1.0));
+            let Some((i, (d, s, q))) = best.filter(|(_, (d, ..))| *d <= self.ask) else {
+                self.book.note("stray_node", n.at, None, None, format!("{} is more than {} m from every line", n.name, self.ask), Level::Report);
+                continue;
+            };
+            let Some(run) = self.runs.get(i) else { continue };
+            let (len, row) = (length(&run.pts), run.row);
+            // At an end: the ends were joined already.
+            if s < self.snap || len - s < self.snap {
+                continue;
+            }
+            let cut = d < self.snap || self.book.note("node_off_line", n.at, Some(q), Some(row), format!("{} is {d:.2} m off the line", n.name), Level::Ask);
+            if cut {
+                if let Some(run) = self.runs.get_mut(i) {
+                    run.cuts.push(s);
+                }
+                self.anchors.push((q, k));
+            }
+        }
+    }
+
+    /// Dimensions on lines: each end mid-line, where the written length starts or stops, is
+    /// proposed as a cut; a dimension on no line is reported.
+    fn dimension_cuts(&mut self) {
+        let vertices: usize = self.runs.iter().map(|r| r.pts.len()).sum();
+        for (k, dm) in self.dims.iter().enumerate() {
+            self.work += 2 * vertices;
+            if self.work > MAX_WORK {
+                return;
+            }
+            let best = self
+                .runs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.gone)
+                .filter_map(|(i, r)| {
+                    let (da, sa, qa) = foot(&r.pts, dm.a)?;
+                    let (db, sb, qb) = foot(&r.pts, dm.b)?;
+                    Some((da.max(db), i, (sa, qa), (sb, qb)))
+                })
+                .filter(|(d, ..)| *d <= self.snap)
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let Some((_, i, (sa, qa), (sb, qb))) = best else {
+                let mid = Coord::new((dm.a.x + dm.b.x) / 2.0, (dm.a.y + dm.b.y) / 2.0);
+                self.book.note("stray_dimension", mid, None, None, format!("a {:.2} m dimension on no line", dm.measure), Level::Report);
+                continue;
+            };
+            self.on.push((k, i, sa.min(sb), sa.max(sb)));
+            for (s, q) in [(sa, qa), (sb, qb)] {
+                let Some(run) = self.runs.get(i) else { continue };
+                let (len, row) = (length(&run.pts), run.row);
+                if s < self.snap || len - s < self.snap || run.cuts.iter().any(|c| (c - s).abs() < self.snap) {
+                    continue;
+                }
+                let note = format!("a {:.2} m dimension ends here, mid-line", dm.measure);
+                if self.book.note("cut_at_dimension", q, None, Some(row), note, Level::Ask)
+                    && let Some(run) = self.runs.get_mut(i)
+                {
+                    run.cuts.push(s);
+                }
+            }
+        }
+    }
+
     /// The network: each line cut into its pieces, with the nodes at their ends, the length a
     /// dimension notes and the length drawn. Pieces whose length disagrees, or that lack a node
     /// or a dimension, are reported.
@@ -717,5 +941,141 @@ mod tests {
         // Junk numbers fall back to the defaults or are clamped.
         let (net, _) = run(vec![base()], serde_json::json!({"lines": "lines", "snap": "-1", "ask": 1e308, "lengthTolerance": "x"}));
         assert_eq!(net.features.len(), 1);
+    }
+
+    #[test]
+    fn gaps_are_fixed_proposed_or_reported() {
+        let l = || {
+            lines(&[
+                ("ONG 300", &[(0.0, 0.0), (100.0, 0.0)]),
+                ("ONG 300", &[(100.3, 0.0), (200.0, 0.0)]),
+                ("ONG 300", &[(0.0, 50.0), (100.0, 50.0)]),
+                ("ONG 300", &[(105.0, 50.0), (200.0, 50.0)]),
+            ])
+        };
+        let (net, props) = run(vec![l()], serde_json::json!({"lines": "lines"}));
+        assert_eq!(found(&props, "gap"), [("fixed".into(), "accept".into()), ("ask".into(), "".into())], "0.3 m fixed, 5 m asked once");
+        assert_eq!(found(&props, "dangling_end").len(), 4);
+        assert!((number(&net, 0, "len_drawn") - 100.3).abs() < 1e-3, "the first line reaches the second");
+        assert!((number(&net, 2, "len_drawn") - 100.0).abs() < 1e-3, "the 5 m gap waits for a decision");
+        let props = decide(props, "gap", "accept");
+        let (net, again) = run(vec![l(), props], serde_json::json!({"lines": "lines", "proposals": "props"}));
+        assert!((number(&net, 2, "len_drawn") - 105.0).abs() < 1e-3, "accepted: joined");
+        assert_eq!(found(&again, "gap"), [("fixed".into(), "accept".into()), ("ask".into(), "accept".into())]);
+        // Skipping a certain fix undoes it.
+        let props = decide(again, "gap", "skip");
+        let (net, _) = run(vec![l(), props], serde_json::json!({"lines": "lines", "proposals": "props"}));
+        assert!((number(&net, 0, "len_drawn") - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn overshoots_are_trimmed_or_proposed() {
+        let (net, props) = run(
+            vec![lines(&[
+                ("ONG 300", &[(0.0, 200.0), (100.0, 200.0)]),
+                ("ONG 300", &[(50.0, 250.0), (50.0, 199.7)]),
+                ("ONG 300", &[(80.0, 250.0), (80.0, 197.0)]),
+            ])],
+            serde_json::json!({"lines": "lines"}),
+        );
+        assert_eq!(found(&props, "overshoot"), [("fixed".into(), "accept".into()), ("ask".into(), "".into())]);
+        assert!((number(&net, 1, "len_drawn") - 50.0).abs() < 1e-3, "trimmed where it crosses");
+        assert!((number(&net, 2, "len_drawn") - 53.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn duplicates_are_dropped_or_proposed() {
+        let (net, props) = run(
+            vec![lines(&[
+                ("ONG 300", &[(0.0, 0.0), (100.0, 0.0)]),
+                ("ong 300", &[(100.0, 0.0), (0.0, 0.0)]),
+                ("ONG 300", &[(0.0, 50.0), (100.0, 50.0)]),
+                ("ONG 500", &[(0.0, 50.0), (100.0, 50.0)]),
+            ])],
+            serde_json::json!({"lines": "lines"}),
+        );
+        assert_eq!(found(&props, "duplicate"), [("fixed".into(), "accept".into()), ("ask".into(), "".into())]);
+        assert_eq!(net.features.len(), 3);
+    }
+
+    #[test]
+    fn crossings_mid_line_are_proposed() {
+        let l = || {
+            lines(&[
+                ("ONG 300", &[(0.0, 0.0), (100.0, 0.0)]),
+                ("ONG 500", &[(50.0, -50.0), (50.0, 50.0)]),
+                ("ONG 300", &[(0.0, 200.0), (100.0, 200.0)]),
+                ("ONG 300", &[(80.0, 250.0), (80.0, 197.0)]),
+            ])
+        };
+        let (net, props) = run(vec![l()], serde_json::json!({"lines": "lines"}));
+        assert_eq!(found(&props, "crossing"), [("ask".into(), "".into())], "an overshoot isn't a crossing");
+        assert_eq!(net.features.len(), 4);
+        let (net, _) = run(vec![l(), decide(props, "crossing", "accept")], serde_json::json!({"lines": "lines", "proposals": "props"}));
+        assert_eq!(net.features.len(), 6, "both lines cut where they cross");
+    }
+
+    #[test]
+    fn lines_are_cut_at_nodes() {
+        let l = || lines(&[("ONG 300", &[(0.0, 0.0), (100.0, 0.0)])]);
+        let n = || nodes(&[("A0", 0.0, 0.0), ("A1", 40.0, 0.2), ("A2", 70.0, 3.0), ("A3", 50.0, 80.0), ("A4", 100.0, 0.0)]);
+        let p = serde_json::json!({"lines": "lines", "nodes": "nodes"});
+        let (net, props) = run(vec![l(), n()], p.clone());
+        assert_eq!(net.features.len(), 2, "cut at the node 0.2 m off");
+        assert_eq!((txt(&net, 0, "node1"), txt(&net, 0, "node2"), txt(&net, 1, "node2")), ("A0".into(), "A1".into(), "A4".into()));
+        assert!((number(&net, 0, "len_drawn") - 40.0).abs() < 1e-3);
+        assert_eq!(found(&props, "node_off_line"), [("ask".into(), "".into())]);
+        assert_eq!(found(&props, "stray_node").len(), 1);
+        let mut p = p;
+        p["proposals"] = "props".into();
+        let (net, _) = run(vec![l(), n(), decide(props, "node_off_line", "accept")], p);
+        assert_eq!(net.features.len(), 3);
+        assert_eq!((txt(&net, 1, "node2"), txt(&net, 2, "node1")), ("A2".into(), "A2".into()));
+        assert_eq!(number(&net, 2, "n1_TK"), 5.0);
+    }
+
+    /// QH12's case: an ONG 500 run drawn 195.87 m between two manholes, its dimension 130.29 m
+    /// from the first, both ends 0.1 m off the run.
+    #[test]
+    fn a_dimension_ending_mid_line_cuts_it_when_accepted() {
+        let layers = || vec![lines(&[("ONG 500", &[(0.0, 0.0), (195.87, 0.0)])]), nodes(&[("A1", 0.0, 0.0), ("A2", 195.87, 0.0)]), dims(&[((0.0, 0.1), (130.29, 0.1), 130.29)])];
+        let p = serde_json::json!({"lines": "lines", "nodes": "nodes", "dimensions": "dims"});
+        let (net, props) = run(layers(), p.clone());
+        assert_eq!(net.features.len(), 1);
+        assert!(net.value(0, net.field_index("len_noted").unwrap()).is_null(), "the dimension is part of the run only");
+        assert_eq!(found(&props, "cut_at_dimension"), [("ask".into(), "".into())], "its start is at a manhole already");
+        assert_eq!(found(&props, "piece_without_dimension").len(), 1);
+
+        let mut p = p;
+        p["proposals"] = "props".into();
+        let mut l = layers();
+        l.push(decide(props, "cut_at_dimension", "accept"));
+        let (net, props) = run(l, p);
+        assert_eq!(net.features.len(), 2);
+        assert_eq!(number(&net, 0, "len_noted"), 130.29);
+        assert!(number(&net, 0, "len_diff").abs() < 1e-3);
+        assert_eq!((txt(&net, 0, "node1"), txt(&net, 0, "node2"), txt(&net, 1, "node2")), ("A1".into(), "".into(), "A2".into()));
+        assert!((number(&net, 1, "len_drawn") - 65.58).abs() < 1e-3);
+        assert_eq!(found(&props, "cut_at_dimension"), [("ask".into(), "accept".into())]);
+        assert_eq!(found(&props, "length_mismatch").len(), 0);
+    }
+
+    #[test]
+    fn lengths_that_disagree_are_reported() {
+        let (net, props) = run(
+            vec![lines(&[("ONG 300", &[(0.0, 0.0), (90.0, 0.0)])]), dims(&[((0.0, 0.0), (90.0, 0.0), 70.0)])],
+            serde_json::json!({"lines": "lines", "dimensions": "dims"}),
+        );
+        assert!((number(&net, 0, "len_diff") - 20.0).abs() < 1e-3);
+        assert_eq!(found(&props, "length_mismatch").len(), 1);
+    }
+
+    #[test]
+    fn a_dimension_on_no_line_is_reported() {
+        let (_, props) = run(
+            vec![lines(&[("ONG 300", &[(0.0, 0.0), (90.0, 0.0)])]), dims(&[((0.0, 30.0), (90.0, 30.0), 90.0)])],
+            serde_json::json!({"lines": "lines", "dimensions": "dims"}),
+        );
+        assert_eq!(found(&props, "stray_dimension").len(), 1);
     }
 }
