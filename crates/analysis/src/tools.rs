@@ -535,6 +535,19 @@ pub static TOOLS: &[ToolSpec] = &[
         ],
         run: zonal_stats,
     },
+    ToolSpec {
+        id: "cadLayers",
+        name: "Split CAD Layers",
+        toolbox: "Conversion › CAD",
+        summary: "Splits a layer read from a DXF or DWG drawing into one layer per CAD layer, or per name prefix.",
+        params: &[
+            P { name: "input", label: "Input Features", kind: K::VectorLayer, required: true, default: "", help: "A layer read from a DXF or DWG drawing (it has a 'layer' field)." },
+            P { name: "layers", label: "CAD Layers", kind: K::Text, required: false, default: "", help: "The CAD layers to keep, separated by ';', with * for any characters (DAT_*;ONG *). Empty keeps every layer." },
+            P { name: "group", label: "One Layer Per", kind: K::Choice(&["Each layer", "Prefix"]), required: false, default: "\"Each layer\"", help: "Prefix: the part of a name before its first '_' (DAT_CT_Dichvu goes to DAT)." },
+            P { name: "decimalComma", label: "Read Decimal Commas", kind: K::Bool, required: false, default: "true", help: "A text field whose every value is a number, written with a decimal comma (4,17) or point, becomes a number field." },
+        ],
+        run: crate::cad::split_layers,
+    },
 ];
 
 // ---------------------------------------------------------------------------------------------
