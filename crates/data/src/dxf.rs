@@ -245,7 +245,7 @@ enum Shape {
     Polygon(Vec<P3>),
     /// A hatch's boundary paths: rings, holes found by nesting.
     Rings(Vec<Vec<P3>>),
-    Insert(Insert),
+    Insert(Box<Insert>),
 }
 
 #[derive(Clone, Debug)]
@@ -659,7 +659,7 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
         "HATCH" => {
             hatch(g).map(|rings| Shape::Rings(rings.into_iter().map(|r| r.into_iter().map(|p| ocs.apply(p)).collect()).collect()))?
         }
-        "INSERT" => Shape::Insert(Insert {
+        "INSERT" => Shape::Insert(Box::new(Insert {
             block: g.s(2)?.trim().to_string(),
             at: g.pt(10).unwrap_or([0.0; 3]),
             scale: [g.f(41).unwrap_or(1.0), g.f(42).unwrap_or(1.0), g.f(43).unwrap_or(1.0)],
@@ -673,11 +673,11 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
             fallback_text: None,
             attribs: Vec::new(),
             measured: None,
-        }),
+        })),
         // A dimension draws its (anonymous) block, already placed in the drawing's coordinates.
         "DIMENSION" => {
             let (fallback, fallback_text) = dimension(g);
-            Shape::Insert(Insert {
+            Shape::Insert(Box::new(Insert {
                 block: g.s(2).map(str::trim).unwrap_or("").to_string(),
                 at: [0.0; 3],
                 scale: [1.0; 3],
@@ -691,7 +691,7 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
                 fallback_text,
                 attribs: Vec::new(),
                 measured: measured(g),
-            })
+            }))
         }
         // A multiline: its centre line (the vertices it runs through).
         "MLINE" => {
@@ -1421,7 +1421,18 @@ fn attribute_point(e: &Ent, ins: &Insert, xf: &Xf, layer: &str, color: i64, line
 
 /// A linear dimension's measured points as a line of the lines layer, with the length it
 /// measures in a `measure` field: where a length is written on the drawing.
-fn measured_line(e: &Ent, ins: &Insert, (a, b, m): (P3, P3, f64), xf: &Xf, layer: &str, color: i64, linetype: Option<&str>, paper: bool, block: Option<&str>, out: &mut Out) {
+fn measured_line(
+    e: &Ent,
+    ins: &Insert,
+    (a, b, m): (P3, P3, f64),
+    xf: &Xf,
+    layer: &str,
+    color: i64,
+    linetype: Option<&str>,
+    paper: bool,
+    block: Option<&str>,
+    out: &mut Out,
+) {
     if out.count >= MAX_FEATURES {
         out.capped = true;
         return;
