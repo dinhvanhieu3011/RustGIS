@@ -74,6 +74,8 @@ reported only when it has no node). Defaults come from the measurements above.
   its INSERTs are counted per reference, and the read report says
   "3 external drawings not read: Xr.nen.HIENTRANG.dwg, …; bind them in CAD to include them".
   Not read here (later work: it needs `Services` on the web and an ODA run per reference).
+- **Dimensions keep their measured points.** A linear DIMENSION also makes a line between its
+  measured points 13 and 14, with its measure (42) in a `measure` field (phase 2).
 
 ### In `rustgis-analysis` (new `cad.rs`): tool `cadLayers` ("Split CAD Layers", Conversion › CAD)
 | Parameter | Kind | Default | Meaning |
@@ -93,9 +95,11 @@ At most 500 outputs (a hostile drawing can have thousands of layers); the rest a
 | Parameter | Kind | Default |
 |---|---|---|
 | `lines` | VectorLayer, required | pipe/cable runs |
+| `layers` | Text | all | CAD layers of `lines` to use, `;`-separated, `*` wildcard (`ONG *`) |
 | `nodes` | PointLayer | manholes, poles |
-| `nodeName` | Field | `TEN` if present, else `A` |
+| `nodeName` | Text | empty | field naming nodes; empty uses `TEN`, else `A` |
 | `dimensions` | VectorLayer | dimensions from `cadLayers` (their measured points 13/14 and `measure`) |
+| `proposals` | PointLayer | earlier run's proposals with `decision` set: accepted fixes are made |
 | `snap`, `ask` | Number | 0.5, 10 |
 | `lengthTolerance` | Number | 0.5 |
 
@@ -108,10 +112,11 @@ Steps:
    `n1_`, `n2_`.
 4. **Match dimensions.** A dimension whose points 13 and 14 both lie within `snap` of a run belongs
    to the stretch between them: `len_noted` = its measure.
-5. **Compare lengths.** `len_drawn` is the geodesic length (`rustgis_geom::geodesic_length_m`).
-   Web-Mercator metres are not used: at latitude 21° they are 7 % long. The VN-2000 grid scale
-   factor (0.9999 at the central meridian, up to about 1.0003 at a 3° zone's edge) makes geodesic
-   and drawing lengths differ by ≤0.04 % (0.3 m on 806 m), inside `lengthTolerance`.
+5. **Compare lengths.** `len_drawn` is the sum of `rustgis_geom::wgs84_distance_m` (the ellipsoid:
+   the sphere is off by up to 0.5 %, 4 m on 806 m). Web-Mercator metres are not used: at latitude 21°
+   they are 7 % long. The VN-2000 grid scale factor (0.9999 at the central meridian, up to about 1.0003
+   at a 3° zone's edge) makes geodesic and drawing lengths differ by ≤0.04 % (0.3 m on 806 m), inside
+   `lengthTolerance`.
 
 Proposals (never applied without `accept`):
 | `kind` | When |
@@ -120,20 +125,25 @@ Proposals (never applied without `accept`):
 | `crossing` | runs cross mid-span with no node (may be pipes at different depths) |
 | `node_off_line` | node between `snap` and `ask` from a run |
 | `cut_at_dimension` | a dimension end falls mid-piece: cut there |
-| `partial_duplicate` | runs overlap partly, or fully across CAD layers |
+| `duplicate` | a line drawn twice across CAD layers (on one layer it is dropped, recorded as fixed) |
+
+Partial overlaps aren't detected yet: added when a drawing has some.
 
 Reports only (no fix to propose): `length_mismatch` (|drawn − noted| > `lengthTolerance` with no
 cut that explains it), `piece_without_node`, `piece_without_dimension`, `stray_node`,
-`stray_dimension`, `dangling_end` (end beyond `ask` from anything, with no node).
+`stray_dimension` (a dimension on no line), `dangling_end` (end beyond `ask` from anything, with no node).
 
 Outputs: the network (lines, input fields + `node1`, `node2`, `n1_*`, `n2_*`, `len_drawn`,
 `len_noted`, `len_diff`) and the proposals.
 
-### `cadNetworkApply` ("Apply CAD Fixes", Conversion › CAD)
-Input: the network and its proposals. Applies `accept`ed proposals in order (gaps, then cuts),
-re-runs steps 3–5 on the result, writes the network as an update and drops applied proposals.
-A proposal whose target no longer matches (the user edited the line) is skipped and reported.
-Implemented as a tool returning `Output::Update`, so undo is the existing tool undo.
+### Applying decisions
+Built as a re-run, not a separate tool: `cadNetwork` with `proposals` (an earlier run's
+proposals layer, `decision` set) makes every accepted fix, leaves skipped ones (also certain
+fixes the user skipped) and writes undecided ones again. A finding is matched to its decision by
+kind and place (within `snap`, at least 5 cm). Hand fixes go on the input lines (`edit.*`), so
+every re-run keeps them; undo is the run's `gp.run` step; each run adds a new network and
+proposals layer. Why: `Output::Update` replaces one layer, and applying changes two (network and
+proposals) and needs the nodes and dimensions again.
 
 ## Phase 3: `cadParcels`
 ### `cadParcels` ("Build Plots From CAD", Conversion › CAD)
@@ -159,8 +169,8 @@ Proposals: division-line `gap` between `snap` and `ask`; `two_tables` (one plot,
 split the plot or drop a table); `table_outside` (table in no plot); `code_conflict` (layer name and
 plot prefix give different codes); `unmapped` (no code: user picks one). Reports: `no_table`,
 `area_mismatch` (geodesic area vs `D` ha beyond 1 %), `overlap` and `gap` between plots
-(`topology::overlaps`, `topology::gaps`). Applied with the same apply tool (a `layer` parameter
-names which result it updates).
+(`topology::overlaps`, `topology::gaps`). Applied the same way: run again with the decided
+proposals.
 
 `rustgis-analysis` doesn't depend on `rustgis-map`; the mapping table goes to the tool as a
 parameter filled by the engine, or moves to `analysis`. Decided in the phase 3 plan.
